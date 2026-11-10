@@ -2,7 +2,7 @@ import http from "node:http";
 import { API_VERSION, SHIPMENT_STATUSES } from "@lab/shared-contracts";
 
 export function health() {
-  return { ok: true, api: API_VERSION, sha: process.env.GIT_SHA ?? "dev" };
+  return { ok: true, api: API_VERSION, sha: process.env.GIT_SHA ?? "dev", uptime: Math.round(process.uptime()) };
 }
 
 export function createServer() {
