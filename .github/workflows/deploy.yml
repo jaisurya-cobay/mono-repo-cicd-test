@@ -149,13 +149,25 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.app }}
           cache-to: type=gha,mode=max,scope=${{ matrix.app }}
 
+  # Production only: the single human approval for the whole release. The deploy jobs below use
+  # "production-deploy" (holds the AWS secrets, no reviewers), so a release asks once, not once per job.
+  approve:
+    name: approve production
+    needs: plan
+    if: needs.plan.outputs.env == 'production' && needs.plan.outputs.any == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: production
+    steps:
+      - run: echo "Approved by ${{ github.triggering_actor }} for ${{ needs.plan.outputs.sha }}"
+
   deploy-server:
     name: deploy ${{ matrix.app }}
-    needs: [plan, image]
-    if: always() && needs.image.result == 'success'
+    needs: [plan, image, approve]
+    if: always() && needs.image.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.approve.result)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    environment: ${{ needs.plan.outputs.env }}
+    environment: ${{ needs.plan.outputs.env == 'production' && 'production-deploy' || needs.plan.outputs.env }}
     permissions:
       contents: read
       deployments: write
@@ -206,14 +218,15 @@ jobs:
   # Runs when the server deploy succeeded or had nothing to do.
   deploy-static:
     name: deploy ${{ matrix.app }}
-    needs: [plan, test, deploy-server]
+    needs: [plan, test, approve, deploy-server]
     if: >-
       always() && needs.plan.result == 'success' && needs.plan.outputs.static != '[]' &&
       contains(fromJSON('["success","skipped"]'), needs.test.result) &&
+      contains(fromJSON('["success","skipped"]'), needs.approve.result) &&
       contains(fromJSON('["success","skipped"]'), needs.deploy-server.result)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    environment: ${{ needs.plan.outputs.env }}
+    environment: ${{ needs.plan.outputs.env == 'production' && 'production-deploy' || needs.plan.outputs.env }}
     permissions:
       contents: read
       deployments: write
