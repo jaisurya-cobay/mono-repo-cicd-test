@@ -8,8 +8,8 @@
   "scripts": {
     "lint": "node --check src/app.js && node --check src/index.js",
     "typecheck": "node -e \"import('./src/app.js')\"",
-    "test": "node --test test/unit/",
-    "integration": "node --test test/integration/",
+    "test": "node --test \"test/unit/**/*.test.js\"",
+    "integration": "node --test \"test/integration/**/*.test.js\"",
     "start": "node src/index.js"
   }
 }

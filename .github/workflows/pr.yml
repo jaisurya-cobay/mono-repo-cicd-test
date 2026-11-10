@@ -90,14 +90,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
+      # Full objects (no partial-clone filter): TruffleHog clones the checkout and can't fetch lazily.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-          filter: tree:0
       # Only the commits in this PR, verified secrets only: seconds, and no noise from old history.
       - name: Secrets in the diff (TruffleHog)
         run: >-
-          docker run --rm -v "$PWD:/repo" trufflesecurity/trufflehog:3.99.8
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" trufflesecurity/trufflehog:3.99.8
           git file:///repo --since-commit ${{ needs.lane.outputs.base_sha }} --branch HEAD
           --results=verified --fail --no-update
       # Reads the lockfile only: no install needed.
