@@ -1,4 +1,4 @@
 import { API_VERSION } from "@lab/shared-contracts";
 
-export const title = "Tracking";
+export const title = "Track your order";
 export const apiPath = `/${API_VERSION}`;
