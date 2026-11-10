@@ -272,13 +272,14 @@ jobs:
           DEPLOYMENT_ID: ${{ steps.start.outputs.id }}
         run: .github/scripts/record.sh ${{ job.status == 'success' && 'success' || 'failure' }} - - -
 
-  # Production only, after every deploy succeeded: tag + GitHub Release (Jira/Slack hook in here),
-  # then a back-merge PR into develop and qa when master has code they don't (hotfixes).
+  # Every push to master, once nothing failed: tag + GitHub Release when something deployed
+  # (Jira/Slack hook in here), then a back-merge PR into develop and qa when master has code they
+  # don't (hotfixes). Both steps are safe to re-run.
   release:
     name: release
     needs: [plan, deploy-server, deploy-static]
     if: >-
-      always() && github.event_name == 'push' && github.ref_name == 'master' && needs.plan.outputs.any == 'true' &&
+      always() && github.event_name == 'push' && github.ref_name == 'master' && needs.plan.result == 'success' &&
       contains(fromJSON('["success","skipped"]'), needs.deploy-server.result) &&
       contains(fromJSON('["success","skipped"]'), needs.deploy-static.result)
     runs-on: ubuntu-24.04
@@ -293,10 +294,12 @@ jobs:
           fetch-depth: 0
           filter: tree:0
       - name: Tag + GitHub Release
+        if: needs.plan.outputs.any == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="release-$(date -u +%Y%m%d)-${GITHUB_SHA:0:7}"
+          if gh release view "$tag" >/dev/null 2>&1; then echo "$tag already released"; exit 0; fi
           gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --generate-notes
       - name: Back-merge master into develop and qa
         env:
@@ -308,6 +311,9 @@ jobs:
             if git diff --quiet "$base" "$GITHUB_SHA"; then echo "$target: up to date"; continue; fi
             branch="backmerge/master-to-$target-${GITHUB_SHA:0:7}"
             git push origin "$GITHUB_SHA:refs/heads/$branch"
+            if [[ -n $(gh pr list --head "$branch" --base "$target" --json number --jq '.[0].number') ]]; then
+              echo "$target: back-merge PR already open"; continue
+            fi
             gh pr create --base "$target" --head "$branch" \
               --title "chore: back-merge master into $target" \
               --body "Automatic back-merge after production release ${GITHUB_SHA:0:7}."
