@@ -1,0 +1,23 @@
+name: Setup workspace
+description: pnpm + Node from the repo pins, restored pnpm store and Nx cache, frozen install.
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v6
+      with:
+        run_install: false
+
+    - uses: actions/setup-node@v6
+      with:
+        node-version-file: .nvmrc
+        cache: pnpm
+
+    # Nx task results carry over between runs: unchanged projects restore instead of re-running.
+    - uses: actions/cache@v6
+      with:
+        path: .nx/cache
+        key: nx-${{ runner.os }}-${{ github.sha }}
+        restore-keys: nx-${{ runner.os }}-
+
+    - run: pnpm install --frozen-lockfile
+      shell: bash

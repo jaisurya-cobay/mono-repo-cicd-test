@@ -1,0 +1,14 @@
+{
+  "name": "@lab/post-purchase-tracking",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "nx": { "tags": ["deploy:static"] },
+  "dependencies": { "@lab/shared-contracts": "workspace:*" },
+  "scripts": {
+    "lint": "node --check src/main.js && node --check build.js",
+    "typecheck": "node -e \"import('./src/main.js')\"",
+    "test": "node --test test/",
+    "build": "node build.js"
+  }
+}

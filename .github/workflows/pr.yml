@@ -1,0 +1,149 @@
+name: PR
+
+# One required check, "ci", for every PR. What runs behind it depends on the lane:
+#   fast       feature -> qa             affected lint/typecheck/unit + diff security (tests gate the deploy, not the PR)
+#   promotion  qa -> develop, develop -> master   staging gate only; the code was tested on its way into qa
+#   hotfix     hotfix/* -> master        full affected CI (unit + integration + build); gate waived
+#   backmerge  master -> develop/qa      into qa: fast lane; into develop: nothing to prove (already in production)
+#   invalid    anything else into develop/master  fails
+on:
+  pull_request:
+    branches: [qa, develop, master]
+  # Back-merge PRs are opened by GITHUB_TOKEN, which never triggers pull_request runs.
+  # The deploy workflow dispatches this instead; the "ci" check lands on the same head commit.
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Target branch of the PR
+        required: true
+        type: choice
+        options: [qa, develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lane:
+    name: lane
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      lane: ${{ steps.lane.outputs.lane }}
+      base_sha: ${{ steps.lane.outputs.base_sha }}
+      head_sha: ${{ steps.lane.outputs.head_sha }}
+    steps:
+      - id: lane
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_REF: ${{ github.base_ref || inputs.base }}
+          HEAD_REF: ${{ github.head_ref || github.ref_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          case "$BASE_REF:$HEAD_REF" in
+            develop:qa | master:develop)        lane=promotion ;;
+            master:hotfix/*)                    lane=hotfix ;;
+            develop:master | develop:backmerge/*) lane=backmerge ;;
+            qa:*)                               lane=fast ;;
+            *)                                  lane=invalid ;;
+          esac
+          base_sha=${PR_BASE_SHA:-$(gh api "repos/$GITHUB_REPOSITORY/commits/$BASE_REF" --jq .sha)}
+          echo "lane=$lane" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$PR_HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "### Lane: \`$lane\` ($HEAD_REF → $BASE_REF)" >> "$GITHUB_STEP_SUMMARY"
+          if [[ $lane == invalid ]]; then
+            echo "::error::$HEAD_REF -> $BASE_REF is not allowed. develop only takes qa; master only takes develop or hotfix/*."
+          fi
+
+  checks:
+    name: checks
+    needs: lane
+    if: contains(fromJSON('["fast","hotfix"]'), needs.lane.outputs.lane)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          filter: tree:0
+      - uses: ./.github/actions/setup
+
+      - name: Lint, typecheck, unit tests (affected only)
+        run: pnpm exec nx affected -t lint typecheck test --base=${{ needs.lane.outputs.base_sha }} --head=HEAD --outputStyle=static
+
+      # A hotfix skips QA and staging, so it also gets the tiers a qa merge would run before deploying.
+      - name: Integration tests + build (hotfix only)
+        if: needs.lane.outputs.lane == 'hotfix'
+        env:
+          MODE: production
+        run: pnpm exec nx affected -t integration build --base=${{ needs.lane.outputs.base_sha }} --head=HEAD --outputStyle=static
+
+  security:
+    name: security
+    needs: lane
+    if: contains(fromJSON('["fast","hotfix"]'), needs.lane.outputs.lane)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          filter: tree:0
+      # Only the commits in this PR, verified secrets only: seconds, and no noise from old history.
+      - name: Secrets in the diff (TruffleHog)
+        run: >-
+          docker run --rm -v "$PWD:/repo" trufflesecurity/trufflehog:3.99.8
+          git file:///repo --since-commit ${{ needs.lane.outputs.base_sha }} --branch HEAD
+          --results=verified --fail --no-update
+      # Reads the lockfile only: no install needed.
+      - uses: pnpm/action-setup@v6
+        with:
+          run_install: false
+      - name: Dependency audit (high/critical)
+        run: pnpm audit --audit-level high
+
+  gate:
+    name: staging gate
+    needs: lane
+    if: needs.lane.outputs.lane == 'promotion'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      deployments: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.lane.outputs.head_sha }}
+          fetch-depth: 0
+          filter: tree:0
+      - uses: ./.github/actions/setup
+      - name: Every promoted app already runs this code in the lower environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOWER_ENV: ${{ github.base_ref == 'master' && 'staging' || 'QA' }}
+          BASE_SHA: ${{ needs.lane.outputs.base_sha }}
+          HEAD_SHA: ${{ needs.lane.outputs.head_sha }}
+        run: node .github/scripts/gate.mjs
+
+  # The only required status check. always() so a skipped lane still reports, and
+  # anything other than success/skipped (failure, cancelled) fails it.
+  ci:
+    name: ci
+    needs: [lane, checks, security, gate]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - env:
+          LANE: ${{ needs.lane.outputs.lane }}
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "lane=$LANE results=$RESULTS"
+          [[ $LANE != invalid && -n $LANE ]] || exit 1
+          for r in $RESULTS; do [[ $r == success || $r == skipped ]] || exit 1; done

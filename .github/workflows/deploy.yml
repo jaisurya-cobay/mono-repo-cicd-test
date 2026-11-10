@@ -1,0 +1,303 @@
+name: Deploy
+
+# push qa      -> QA:         integration tests for changed apps, build the server image, deploy
+# push develop -> staging:    no tests, no server build: reuse the image QA ran; rebuild static apps for staging
+# push master  -> production: same as staging, behind the production approval; then release + back-merge
+# dispatch     -> one app, any environment, any commit (manual deploy or rollback)
+#
+# What deploys is decided per app: changed since that app's last *successful* deploy to that
+# environment (GitHub Deployments, task "deploy:<app>"). A failed or skipped deploy is never lost.
+on:
+  push:
+    branches: [qa, develop, master]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Environment (by branch)
+        required: true
+        type: choice
+        options: [qa, develop, master]
+      app:
+        description: App
+        required: true
+        type: choice
+        options: [post-purchase-server, post-purchase-client, post-purchase-tracking, engine-client]
+      sha:
+        description: Commit to deploy (empty = previous successful deploy, i.e. rollback)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# One deploy per environment at a time; a newer push replaces a still-pending one (it contains
+# the same changes), and a running deploy is never cancelled halfway.
+concurrency:
+  group: deploy-${{ inputs.branch || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      deployments: read
+    outputs:
+      env: ${{ steps.target.outputs.env }}
+      sha: ${{ steps.target.outputs.sha }}
+      server: ${{ steps.plan.outputs.server }}
+      static: ${{ steps.plan.outputs.static }}
+      projects: ${{ steps.plan.outputs.projects }}
+      any: ${{ steps.plan.outputs.any }}
+    steps:
+      - id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ inputs.branch || github.ref_name }}
+          APP: ${{ inputs.app }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          case "$BRANCH" in qa) env=QA ;; develop) env=staging ;; master) env=production ;; esac
+          sha=${SHA:-$GITHUB_SHA}
+          if [[ $GITHUB_EVENT_NAME == workflow_dispatch && -z $SHA ]]; then
+            # Rollback: the newest successful deploy of this app whose commit differs from the current one.
+            ids=$(gh api "repos/$GITHUB_REPOSITORY/deployments?environment=$env&task=deploy:$APP&per_page=50" --jq '.[] | "\(.id) \(.sha)"')
+            current=""
+            while read -r id dsha; do
+              [[ -n $id ]] || continue
+              state=$(gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses?per_page=1" --jq '.[0].state // ""')
+              [[ $state == success ]] || continue
+              if [[ -z $current ]]; then current=$dsha; elif [[ $dsha != "$current" ]]; then sha=$dsha; break; fi
+            done <<< "$ids"
+            [[ $sha != "$GITHUB_SHA" ]] || { echo "::error::No earlier successful $APP deploy in $env to roll back to"; exit 1; }
+            echo "::notice::Rolling back $APP in $env from ${current:0:7} to ${sha:0:7}"
+          fi
+          echo "env=$env" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+          fetch-depth: 0
+          filter: tree:0
+      - uses: ./.github/actions/setup
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_ENV: ${{ steps.target.outputs.env }}
+          HEAD_SHA: ${{ steps.target.outputs.sha }}
+          ONLY_APP: ${{ inputs.app }}
+        run: node .github/scripts/plan.mjs
+
+  # QA only: the tier that gates a deploy. develop/master promote code that already passed here.
+  test:
+    name: test
+    needs: plan
+    if: needs.plan.outputs.any == 'true' && needs.plan.outputs.env == 'QA' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+      - run: pnpm exec nx run-many -t integration -p ${{ needs.plan.outputs.projects }} --outputStyle=static
+
+  # Built once per content hash. Promotion merge commits have new SHAs but the same hash, so
+  # staging and production find the image QA ran and never rebuild.
+  image:
+    name: image (${{ matrix.app }})
+    needs: [plan, test]
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.server != '[]' && needs.test.result != 'failure' && needs.test.result != 'cancelled'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.server) }}
+    steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: exists
+        run: |
+          if docker buildx imagetools inspect "$REGISTRY_IMAGE/${{ matrix.app }}:${{ matrix.hash }}" >/dev/null 2>&1; then
+            echo "::notice::${{ matrix.app }}:${{ matrix.hash }} already built, reusing it"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.exists.outputs.found != 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - if: steps.exists.outputs.found != 'true'
+        uses: docker/setup-buildx-action@v4
+      - if: steps.exists.outputs.found != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.root }}/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY_IMAGE }}/${{ matrix.app }}:${{ matrix.hash }}
+            ${{ env.REGISTRY_IMAGE }}/${{ matrix.app }}:sha-${{ needs.plan.outputs.sha }}
+          cache-from: type=gha,scope=${{ matrix.app }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.app }}
+
+  deploy-server:
+    name: deploy ${{ matrix.app }}
+    needs: [plan, image]
+    if: always() && needs.image.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: ${{ needs.plan.outputs.env }}
+    permissions:
+      contents: read
+      deployments: write
+      packages: write
+    concurrency:
+      group: deploy-${{ needs.plan.outputs.env }}-${{ matrix.app }}
+      cancel-in-progress: false
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.server) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/scripts
+      - id: start
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(.github/scripts/record.sh start "${{ needs.plan.outputs.env }}" "${{ matrix.app }}" "${{ needs.plan.outputs.sha }}" '{"hash":"${{ matrix.hash }}"}')
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # Moves the environment tag to the already-built image: no rebuild.
+      - name: Promote image
+        run: |
+          docker buildx imagetools create \
+            -t "$REGISTRY_IMAGE/${{ matrix.app }}:${{ needs.plan.outputs.env }}" \
+            "$REGISTRY_IMAGE/${{ matrix.app }}:${{ matrix.hash }}"
+      # Stand-in for S3 bundle + SSM blue/green. LAB_FAIL_DEPLOY="<env>:<app>" simulates a failed rollout.
+      - name: Deploy (stub for SSM blue/green)
+        env:
+          TARGET: ${{ needs.plan.outputs.env }}:${{ matrix.app }}
+          FAIL: ${{ vars.LAB_FAIL_DEPLOY }}
+        run: |
+          echo "SSM: pull $REGISTRY_IMAGE/${{ matrix.app }}:${{ matrix.hash }}, start idle colour, health check, swap nginx"
+          [[ "$FAIL" != "$TARGET" ]] || { echo "::error::Simulated failed rollout for $TARGET"; exit 1; }
+          echo "/health ok"
+      - if: always() && steps.start.outputs.id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_ID: ${{ steps.start.outputs.id }}
+        run: .github/scripts/record.sh ${{ job.status == 'success' && 'success' || 'failure' }} - - -
+
+  # After the server, so a client never goes live against an API that isn't there yet.
+  # Runs when the server deploy succeeded or had nothing to do.
+  deploy-static:
+    name: deploy ${{ matrix.app }}
+    needs: [plan, test, deploy-server]
+    if: >-
+      always() && needs.plan.result == 'success' && needs.plan.outputs.static != '[]' &&
+      contains(fromJSON('["success","skipped"]'), needs.test.result) &&
+      contains(fromJSON('["success","skipped"]'), needs.deploy-server.result)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: ${{ needs.plan.outputs.env }}
+    permissions:
+      contents: read
+      deployments: write
+    concurrency:
+      group: deploy-${{ needs.plan.outputs.env }}-${{ matrix.app }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.static) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+      - id: start
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(.github/scripts/record.sh start "${{ needs.plan.outputs.env }}" "${{ matrix.app }}" "${{ needs.plan.outputs.sha }}" '{"hash":"${{ matrix.hash }}"}')
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/setup
+      # Env-specific values are baked in at build time (Vite), so static apps build per environment.
+      - name: Build for ${{ needs.plan.outputs.env }}
+        env:
+          MODE: ${{ needs.plan.outputs.env }}
+          GIT_SHA: ${{ needs.plan.outputs.sha }}
+        run: pnpm exec nx run ${{ matrix.project }}:build --outputStyle=static
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.app }}-${{ needs.plan.outputs.env }}-${{ needs.plan.outputs.sha }}
+          path: ${{ matrix.root }}/dist
+          retention-days: 7
+      - name: Deploy (stub for s3 sync + CloudFront invalidation)
+        env:
+          TARGET: ${{ needs.plan.outputs.env }}:${{ matrix.app }}
+          FAIL: ${{ vars.LAB_FAIL_DEPLOY }}
+        run: |
+          echo "s3 sync ${{ matrix.root }}/dist -> bucket for $TARGET; invalidate /*"
+          [[ "$FAIL" != "$TARGET" ]] || { echo "::error::Simulated failed rollout for $TARGET"; exit 1; }
+      - if: always() && steps.start.outputs.id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_ID: ${{ steps.start.outputs.id }}
+        run: .github/scripts/record.sh ${{ job.status == 'success' && 'success' || 'failure' }} - - -
+
+  # Production only, after every deploy succeeded: tag + GitHub Release (Jira/Slack hook in here),
+  # then a back-merge PR into develop and qa when master has code they don't (hotfixes).
+  release:
+    name: release
+    needs: [plan, deploy-server, deploy-static]
+    if: >-
+      always() && github.event_name == 'push' && github.ref_name == 'master' && needs.plan.outputs.any == 'true' &&
+      contains(fromJSON('["success","skipped"]'), needs.deploy-server.result) &&
+      contains(fromJSON('["success","skipped"]'), needs.deploy-static.result)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          filter: tree:0
+      - name: Tag + GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="release-$(date -u +%Y%m%d)-${GITHUB_SHA:0:7}"
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --generate-notes
+      - name: Back-merge master into develop and qa
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for target in develop qa; do
+            base=$(git merge-base "origin/$target" "$GITHUB_SHA")
+            # Nothing master has that the target lacks (a normal release): no PR.
+            if git diff --quiet "$base" "$GITHUB_SHA"; then echo "$target: up to date"; continue; fi
+            branch="backmerge/master-to-$target-${GITHUB_SHA:0:7}"
+            git push origin "$GITHUB_SHA:refs/heads/$branch"
+            gh pr create --base "$target" --head "$branch" \
+              --title "chore: back-merge master into $target" \
+              --body "Automatic back-merge after production release ${GITHUB_SHA:0:7}."
+            # PRs opened by GITHUB_TOKEN don't trigger pull_request runs; dispatch the check instead.
+            gh workflow run pr.yml --ref "$branch" -f base="$target"
+          done

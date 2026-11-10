@@ -1,0 +1,13 @@
+{
+  "name": "@lab/shared-contracts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "exports": { ".": "./src/index.js" },
+  "scripts": {
+    "lint": "node --check src/index.js",
+    "typecheck": "node -e \"import('./src/index.js')\"",
+    "test": "node --test test/"
+  }
+}

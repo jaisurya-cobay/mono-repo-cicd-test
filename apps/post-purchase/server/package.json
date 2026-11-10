@@ -1,0 +1,15 @@
+{
+  "name": "@lab/post-purchase-server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "nx": { "tags": ["deploy:server"] },
+  "dependencies": { "@lab/shared-contracts": "workspace:*" },
+  "scripts": {
+    "lint": "node --check src/app.js && node --check src/index.js",
+    "typecheck": "node -e \"import('./src/app.js')\"",
+    "test": "node --test test/unit/",
+    "integration": "node --test test/integration/",
+    "start": "node src/index.js"
+  }
+}
