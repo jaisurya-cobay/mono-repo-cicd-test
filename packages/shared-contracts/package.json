@@ -8,6 +8,6 @@
   "scripts": {
     "lint": "node --check src/index.js",
     "typecheck": "node -e \"import('./src/index.js')\"",
-    "test": "node --test test/"
+    "test": "node --test \"test/**/*.test.js\""
   }
 }
