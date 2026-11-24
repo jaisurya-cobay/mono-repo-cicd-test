@@ -5,5 +5,5 @@
   "packageManager": "pnpm@12.15.0",
   "engines": { "node": ">=24 <25" },
   "scripts": { "check": "nx run-many -t lint typecheck test" },
-  "devDependencies": { "nx": "24.0.3" }
+  "devDependencies": { "nx": "24.0.6" }
 }
