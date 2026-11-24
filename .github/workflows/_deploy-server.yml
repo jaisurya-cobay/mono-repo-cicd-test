@@ -1,0 +1,96 @@
+name: Deploy server
+
+# Reusable: put one already-built image live in one environment. Used by deploy.yml and rollback.yml,
+# so there is exactly one deploy implementation. One lock per environment + app: deploys, rollbacks
+# and releases queue behind each other and are never cancelled halfway.
+on:
+  workflow_call:
+    inputs:
+      app: { type: string, required: true }
+      stage: { type: string, required: true }   # qa | staging | production
+      sha: { type: string, required: true }
+      hash: { type: string, required: true }
+      live: { type: boolean, required: true }    # from LIVE_DEPLOYS via plan; false = dry run
+      record: { type: string, required: true }   # deployment record env: <stage> or <stage>-dryrun
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: ${{ inputs.app }} → ${{ inputs.stage }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: server-${{ inputs.stage }}
+    concurrency:
+      group: deploy-${{ inputs.stage }}-${{ inputs.app }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: write
+      packages: write
+      id-token: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}/${{ inputs.app }}:${{ inputs.hash }}
+      LIVE: ${{ inputs.live }}
+      APP: ${{ inputs.app }}
+      STAGE: ${{ inputs.stage }}
+      SHA: ${{ inputs.sha }}
+      HASH: ${{ inputs.hash }}
+      RECORD: ${{ inputs.record }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: tools/ci
+          persist-credentials: false
+      - id: start
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(tools/ci/record.sh start "$RECORD" "$APP" "$SHA" "{\"hash\":\"$HASH\"}")
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      # Deploys never build. The image must already exist (built on the qa merge or the hotfix PR).
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Image exists
+        run: |
+          docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1 \
+            || { echo "::error::$IMAGE not found. Deploys and rollbacks never build; re-run the qa deploy that built it."; exit 1; }
+
+      # Not live for this app + environment: print exactly what would run, change nothing.
+      - name: Plan only (not live for this app + environment)
+        if: env.LIVE != 'true'
+        run: |
+          {
+            echo "### DRY RUN: $APP → $STAGE"
+            echo "- image \`$IMAGE\`"
+            echo "- SSM document Cobay-DeployContainer, targets tag App=$APP, Env=$STAGE"
+            echo "- rolling: max-concurrency 50%, max-errors 0; health gate, then nginx swap; old colour kept on failure"
+            echo "Add $STAGE for $APP to the LIVE_DEPLOYS variable to make this real."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Live path. Lab: stub. Suite: the commented block replaces the stub.
+      - name: Deploy (lab stub for OIDC + SSM rolling blue/green)
+        if: env.LIVE == 'true'
+        env:
+          TARGET: ${{ inputs.stage }}:${{ inputs.app }}
+          FAIL: ${{ vars.LAB_FAIL_DEPLOY }}
+        run: |
+          echo "SSM: pull $IMAGE, start idle colour, health check, swap nginx (50% of instances at a time)"
+          [[ "$FAIL" != "$TARGET" ]] || { echo "::error::Simulated failed rollout for $TARGET: old colour still serving"; exit 1; }
+          echo "/health ok"
+          # Suite:
+          #   aws-actions/configure-aws-credentials (role-to-assume: vars.ROLE_ARN, role-duration-seconds: 900)
+          #   cmd=$(aws ssm send-command --document-name Cobay-DeployContainer \
+          #          --targets Key=tag:App,Values=$APP Key=tag:Env,Values=$STAGE \
+          #          --parameters image=$IMAGE --max-concurrency 50% --max-errors 0 \
+          #          --timeout-seconds 1200 --cloud-watch-output-config CloudWatchOutputEnabled=true \
+          #          --query Command.CommandId --output text)
+          #   wait up to 25 min (longer than the 20-min SSM timeout); on give-up: aws ssm cancel-command
+      - if: always() && steps.start.outputs.id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_ID: ${{ steps.start.outputs.id }}
+        run: tools/ci/record.sh ${{ job.status == 'success' && 'success' || 'failure' }} - - -

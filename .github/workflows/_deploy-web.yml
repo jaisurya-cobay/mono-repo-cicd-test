@@ -1,0 +1,88 @@
+name: Deploy web
+
+# Reusable: put one stored web build live in one environment. The JS/CSS is identical everywhere;
+# only config.json (from this environment's WEB_CONFIG_JSON variable) differs. Order matters:
+# hashed assets first (immutable, never deleted at deploy), config.json, then index.html last,
+# so an open tab never asks for a chunk that is gone. Smoke test; on failure put the old index back.
+on:
+  workflow_call:
+    inputs:
+      app: { type: string, required: true }
+      root: { type: string, required: true }
+      stage: { type: string, required: true }
+      sha: { type: string, required: true }
+      hash: { type: string, required: true }
+      live: { type: boolean, required: true }    # from LIVE_DEPLOYS via plan; false = dry run
+      record: { type: string, required: true }   # deployment record env: <stage> or <stage>-dryrun
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: ${{ inputs.app }} → ${{ inputs.stage }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: web-${{ inputs.stage }}
+    concurrency:
+      group: deploy-${{ inputs.stage }}-${{ inputs.app }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: write
+      actions: read
+      id-token: write
+    env:
+      LIVE: ${{ inputs.live }}
+      APP: ${{ inputs.app }}
+      STAGE: ${{ inputs.stage }}
+      SHA: ${{ inputs.sha }}
+      HASH: ${{ inputs.hash }}
+      RECORD: ${{ inputs.record }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.sha }}
+          sparse-checkout: |
+            tools/ci
+            ${{ inputs.root }}/config.schema.json
+          persist-credentials: false
+      - id: start
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(tools/ci/record.sh start "$RECORD" "$APP" "$SHA" "{\"hash\":\"$HASH\"}")
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+      - name: Fetch the build (made once, on the qa deploy)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/ci/web-build.sh fetch "$APP" "$HASH" dist
+      - name: Write config.json for ${{ inputs.stage }}
+        env:
+          WEB_CONFIG_JSON: ${{ vars.WEB_CONFIG_JSON }}
+          SCHEMA: ${{ inputs.root }}/config.schema.json
+          VERSION_SHA: ${{ inputs.sha }}
+        run: node tools/ci/web-config.mjs dist/config.json
+      - name: Plan only (not live for this app + environment)
+        if: env.LIVE != 'true'
+        run: |
+          {
+            echo "### DRY RUN: $APP → $STAGE (build $HASH)"
+            echo "1. s3 sync dist/assets → s3://<bucket>/assets  (cache-control: max-age=31536000, immutable; no --delete)"
+            echo "2. s3 cp config.json  (cache-control: no-cache)"
+            echo "3. s3 cp index.html   (cache-control: no-cache)  ← last"
+            echo "4. CloudFront invalidate /index.html /config.json, then smoke test the live URL"
+            echo '```json'; cat dist/config.json; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Deploy (lab stub for S3 + CloudFront)
+        if: env.LIVE == 'true'
+        env:
+          TARGET: ${{ inputs.stage }}:${{ inputs.app }}
+          FAIL: ${{ vars.LAB_FAIL_DEPLOY }}
+        run: |
+          echo "assets → index last; smoke test"
+          [[ "$FAIL" != "$TARGET" ]] || { echo "::error::Simulated failed smoke test for $TARGET: previous index.html restored"; exit 1; }
+      - if: always() && steps.start.outputs.id
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_ID: ${{ steps.start.outputs.id }}
+        run: tools/ci/record.sh ${{ job.status == 'success' && 'success' || 'failure' }} - - -

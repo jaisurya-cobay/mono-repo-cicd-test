@@ -1,0 +1,31 @@
+# Version updates monthly, one grouped PR per ecosystem. Security updates are separate and open as
+# soon as a fix exists (they don't follow this schedule). Dependabot PRs target qa like any change.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    target-branch: qa
+    schedule: { interval: monthly }
+    open-pull-requests-limit: 5
+    commit-message: { prefix: "chore(deps)" }
+    groups:
+      npm:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    target-branch: qa
+    schedule: { interval: monthly }
+    commit-message: { prefix: "ci" }
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /apps/post-purchase/server
+    target-branch: qa
+    schedule: { interval: monthly }
+    commit-message: { prefix: "build" }
+    groups:
+      base-images:
+        patterns: ["*"]

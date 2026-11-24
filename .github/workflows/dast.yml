@@ -1,0 +1,34 @@
+name: DAST
+
+# Manual only: a ZAP scan against staging when someone wants it. Report-only.
+# The ZAP authenticated report can contain session tokens: it is never uploaded as an artifact;
+# only the summary table goes to the run summary.
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Staging URL to scan
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  zap:
+    name: ZAP baseline → staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: web-staging
+    permissions:
+      contents: read
+    steps:
+      - env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          [[ $TARGET == https://* ]] || { echo "::error::Target must be an https URL"; exit 1; }
+          mkdir -p zap && chmod 777 zap
+          docker run --rm -v "$PWD/zap:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t "$TARGET" -r report.html -J report.json -I || true
+          jq -r '.site[].alerts[] | "| \(.riskdesc) | \(.alert) | \(.count) |"' zap/report.json \
+            | sort -r | { echo "### ZAP baseline: $TARGET"; echo "| Risk | Alert | Count |"; echo "|---|---|---|"; cat; } >> "$GITHUB_STEP_SUMMARY"
+          rm -rf zap
