@@ -22,7 +22,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - env:
+      - name: Run ZAP baseline scan
+        env:
           TARGET: ${{ inputs.target }}
         run: |
           [[ $TARGET == https://* ]] || { echo "::error::Target must be an https URL"; exit 1; }

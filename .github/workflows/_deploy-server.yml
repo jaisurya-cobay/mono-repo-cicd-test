@@ -38,30 +38,33 @@ jobs:
       HASH: ${{ inputs.hash }}
       RECORD: ${{ inputs.record }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           sparse-checkout: tools/ci
           persist-credentials: false
-      - id: start
+      - name: Open deploy record
+        id: start
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           id=$(tools/ci/record.sh start "$RECORD" "$APP" "$SHA" "{\"hash\":\"$HASH\"}")
           echo "id=$id" >> "$GITHUB_OUTPUT"
       # Deploys never build. The image must already exist (built on the qa merge or the hotfix PR).
-      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+      - name: Log in to image registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Image exists
+      - name: Verify image exists (deploys never build)
         id: image
         run: |
           docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1 \
             || { echo "::error::$IMAGE not found. Deploys and rollbacks never build; re-run the qa deploy that built it."; exit 1; }
 
       # Not live for this app + environment: print exactly what would run, change nothing.
-      - name: Plan only (not live for this app + environment)
+      - name: "Dry run: print the plan (skipped when live)"
         if: env.LIVE != 'true'
         run: |
           {
@@ -73,7 +76,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Live path. Lab: stub. Suite: the commented block replaces the stub.
-      - name: Deploy (lab stub for OIDC + SSM rolling blue/green)
+      - name: "Roll out: SSM rolling blue/green (lab stub)"
         id: rollout
         if: env.LIVE == 'true'
         env:
@@ -91,12 +94,13 @@ jobs:
           #          --timeout-seconds 1200 --cloud-watch-output-config CloudWatchOutputEnabled=true \
           #          --query Command.CommandId --output text)
           #   wait up to 25 min (longer than the 20-min SSM timeout); on give-up: aws ssm cancel-command
-      - if: always() && steps.start.outputs.id
+      - name: Close deploy record
+        if: always() && steps.start.outputs.id
         env:
           GH_TOKEN: ${{ github.token }}
           DEPLOYMENT_ID: ${{ steps.start.outputs.id }}
         run: tools/ci/record.sh ${{ job.status == 'success' && 'success' || 'failure' }} - - -
-      - name: Report
+      - name: Write summary
         if: always()
         env:
           IMG: ${{ steps.image.outcome }}
