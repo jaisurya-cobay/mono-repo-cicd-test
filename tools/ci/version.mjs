@@ -1,7 +1,7 @@
 // Works out the version from PR titles merged since the release base.
 // Env: MODE=rc|final, RELEASE_VERSION_FLOOR (optional), JIRA_RELEASED (optional, comma list), GH_TOKEN.
 // Outputs: version (empty = nothing to release), tag, base, prs (JSON list of {number,title}).
-import { parseVersion, baseVersion, nextVersion, nextRc, countsForVersion } from "./conventions.mjs";
+import { parseVersion, baseVersion, nextVersion, nextRc, countsForVersion, cancelReverts, bumpOf } from "./conventions.mjs";
 import { sh, output, summary } from "./lib.mjs";
 
 const mode = process.env.MODE ?? "rc";
@@ -34,9 +34,12 @@ output("version", version ?? "");
 output("tag", tag);
 output("base", baseTag);
 output("prs", JSON.stringify(prs));
+// Show what each PR contributed, so the number can be checked by eye.
+const kept = new Set(cancelReverts(prs.map((p) => p.title)));
+const effect = (t) => (!kept.has(t) ? "cancelled by revert" : ["none", "patch", "minor", "major"][bumpOf(t)]);
 summary([
   `### Version: ${tag || "nothing to release"}`,
-  `Base ${baseTag}${process.env.RELEASE_VERSION_FLOOR ? ` (floor ${process.env.RELEASE_VERSION_FLOOR})` : ""} · ${prs.length} PR(s) since`,
-  "", "| PR | Title |", "|---|---|",
-  ...prs.map((p) => `| #${p.number} | ${p.title.replace(/\|/g, "\\|")} |`),
+  `Base ${baseTag}${process.env.RELEASE_VERSION_FLOOR ? ` (floor ${process.env.RELEASE_VERSION_FLOOR})` : ""} · ${prs.length} PR(s) since · biggest change decides the bump`,
+  "", "| PR | Title | Counts as |", "|---|---|---|",
+  ...prs.map((p) => `| #${p.number} | ${p.title.replace(/\|/g, "\\|")} | ${effect(p.title)} |`),
 ].join("\n"));
