@@ -39,14 +39,16 @@ jobs:
       HASH: ${{ inputs.hash }}
       RECORD: ${{ inputs.record }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.sha }}
           sparse-checkout: |
             tools/ci
             ${{ inputs.root }}/config.schema.json
           persist-credentials: false
-      - id: start
+      - name: Open deploy record
+        id: start
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -64,7 +66,7 @@ jobs:
           SCHEMA: ${{ inputs.root }}/config.schema.json
           VERSION_SHA: ${{ inputs.sha }}
         run: node tools/ci/web-config.mjs dist/config.json
-      - name: Plan only (not live for this app + environment)
+      - name: "Dry run: print the plan (skipped when live)"
         if: env.LIVE != 'true'
         run: |
           {
@@ -75,7 +77,7 @@ jobs:
             echo "4. CloudFront invalidate /index.html /config.json, then smoke test the live URL"
             echo '```json'; cat dist/config.json; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Deploy (lab stub for S3 + CloudFront)
+      - name: "Upload: assets first, index.html last, smoke test (lab stub)"
         id: rollout
         if: env.LIVE == 'true'
         env:
@@ -84,12 +86,13 @@ jobs:
         run: |
           echo "assets → index last; smoke test"
           [[ "$FAIL" != "$TARGET" ]] || { echo "::error::Simulated failed smoke test for $TARGET: previous index.html restored"; exit 1; }
-      - if: always() && steps.start.outputs.id
+      - name: Close deploy record
+        if: always() && steps.start.outputs.id
         env:
           GH_TOKEN: ${{ github.token }}
           DEPLOYMENT_ID: ${{ steps.start.outputs.id }}
         run: tools/ci/record.sh ${{ job.status == 'success' && 'success' || 'failure' }} - - -
-      - name: Report
+      - name: Write summary
         if: always()
         env:
           FETCH: ${{ steps.fetch.outcome }}

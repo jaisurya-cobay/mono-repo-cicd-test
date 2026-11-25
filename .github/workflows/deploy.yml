@@ -35,19 +35,23 @@ jobs:
       projects: ${{ steps.plan.outputs.projects }}
       any: ${{ steps.plan.outputs.any }}
     steps:
-      - id: stage
+      - name: Map branch to environment
+        id: stage
         env:
           BRANCH: ${{ github.ref_name }}
         run: |
           case "$BRANCH" in qa) s=qa ;; staging) s=staging ;; master) s=production ;; esac
           echo "stage=$s" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           filter: tree:0
           persist-credentials: false
-      - uses: ./.github/actions/setup
-      - id: plan
+      - name: Install Node, pnpm and dependencies (cached)
+        uses: ./.github/actions/setup
+      - name: Compare each app with its last good deploy
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
           STAGE: ${{ steps.stage.outputs.stage }}
@@ -65,10 +69,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup
+      - name: Install Node, pnpm and dependencies (cached)
+        uses: ./.github/actions/setup
       - name: Lint, types, unit and integration tests for the apps being deployed
         env:
           PROJECTS: ${{ needs.plan.outputs.projects }}
@@ -117,16 +123,20 @@ jobs:
       HASH: ${{ matrix.hash }}
       PROJECT: ${{ matrix.project }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - id: stored
+      - name: Check for a stored build of this exact code
+        id: stored
         env:
           GH_TOKEN: ${{ github.token }}
         run: echo "id=$(tools/ci/web-build.sh find "$APP" "$HASH")" >> "$GITHUB_OUTPUT"
-      - if: steps.stored.outputs.id == ''
+      - name: Install Node, pnpm and dependencies (cached)
+        if: steps.stored.outputs.id == ''
         uses: ./.github/actions/setup
-      - if: steps.stored.outputs.id == ''
+      - name: Build once
+        if: steps.stored.outputs.id == ''
         run: pnpm exec nx run "$PROJECT:build" --outputStyle=static
       - if: steps.stored.outputs.id == ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -134,7 +144,7 @@ jobs:
           name: web-${{ matrix.app }}-${{ matrix.hash }}
           path: ${{ matrix.root }}/dist
           retention-days: 90
-      - name: Report
+      - name: Write summary
         if: always()
         env:
           STORED: ${{ steps.stored.outputs.id }}
@@ -214,7 +224,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - id: bot
+      - name: Get release bot token
+        id: bot
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
@@ -222,12 +233,14 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
       # Credentials kept on purpose: this job pushes tags and back-merge branches as the release bot.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # zizmor: ignore[artipacked] (v7)
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # zizmor: ignore[artipacked] (v7)
         with:
           fetch-depth: 0
           filter: tree:0
           token: ${{ steps.bot.outputs.token }}
-      - id: v
+      - name: Work out the version from PR titles
+        id: v
         env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           MODE: ${{ needs.plan.outputs.stage == 'staging' && 'rc' || 'final' }}
@@ -303,7 +316,8 @@ jobs:
       actions: write
       pull-requests: read
     steps:
-      - env:
+      - name: Re-run the open promotion PR's gate if it failed
+        env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SOURCE: ${{ github.ref_name }}
@@ -332,12 +346,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           filter: tree:0
           persist-credentials: false
-      - env:
+      - name: "Send Jira and Slack updates (lab: dry run)"
+        env:
           GH_TOKEN: ${{ github.token }}
           STAGE: ${{ needs.plan.outputs.stage }}
           BEFORE: ${{ github.event.before }}
