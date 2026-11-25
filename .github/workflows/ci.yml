@@ -30,7 +30,8 @@ jobs:
       workflows: ${{ steps.files.outputs.workflows }}
     steps:
       # One API call, no checkout: did this PR touch .github/? Only then do workflow files get linted.
-      - id: files
+      - name: Which files the PR changes
+        id: files
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -39,7 +40,8 @@ jobs:
           n=$(gh api "repos/$GH_REPO/pulls/$N/files" --paginate --jq '[.[] | select(.filename | startswith(".github/"))] | length' | awk '{s+=$1} END {print s+0}')
           echo "workflows=$([[ ${n:-0} -gt 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "count=${n:-0}" >> "$GITHUB_OUTPUT"
-      - id: lane
+      - name: Pick the lane for this route
+        id: lane
         env:
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
@@ -86,12 +88,14 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           filter: tree:0
           persist-credentials: false
-      - uses: ./.github/actions/setup
+      - name: Install Node, pnpm and dependencies (cached)
+        uses: ./.github/actions/setup
       - name: PR title
         id: title
         if: needs.lane.outputs.lane != 'backmerge'
@@ -130,7 +134,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: pnpm exec nx affected -t integration --base="$BASE_SHA" --head=HEAD --outputStyle=static
-      - name: Report
+      - name: Write summary
         if: always()
         env:
           TITLE: ${{ steps.title.outcome }}
@@ -166,13 +170,16 @@ jobs:
     outputs:
       server: ${{ steps.plan.outputs.server }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           filter: tree:0
           persist-credentials: false
-      - uses: ./.github/actions/setup
-      - id: plan
+      - name: Install Node, pnpm and dependencies (cached)
+        uses: ./.github/actions/setup
+      - name: Find server apps the hotfix changes
+        id: plan
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: node tools/ci/hotfix-plan.mjs
@@ -207,7 +214,8 @@ jobs:
       contents: read
     steps:
       # Full objects: TruffleHog clones the checkout and can't fetch lazily.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -229,7 +237,7 @@ jobs:
           echo "files=${#files[@]}" >> "$GITHUB_OUTPUT"
           if [[ ${#files[@]} -eq 0 ]]; then echo "No source files changed"; exit 0; fi
           docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:1.178.0 semgrep scan --config p/default --error --quiet "${files[@]}"
-      - name: Report
+      - name: Write summary
         if: always()
         env:
           SECRETS: ${{ steps.secrets.outcome }}
@@ -254,7 +262,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - name: Syntax and expressions (actionlint)
@@ -263,7 +272,7 @@ jobs:
       - name: Security of workflows (zizmor)
         id: zizmor
         run: pipx run zizmor==1.9.0 --min-severity medium .github/workflows
-      - name: Report
+      - name: Write summary
         if: always()
         env:
           A: ${{ steps.actionlint.outcome }}
@@ -287,14 +296,17 @@ jobs:
       contents: read
       deployments: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           filter: tree:0
           persist-credentials: false
-      - uses: ./.github/actions/setup
-      - env:
+      - name: Install Node, pnpm and dependencies (cached)
+        uses: ./.github/actions/setup
+      - name: Check promoted apps already run this code one environment lower
+        env:
           GH_TOKEN: ${{ github.token }}
           LOWER_ENV: ${{ github.base_ref == 'master' && 'staging' || 'qa' }}
           LIVE_DEPLOYS: ${{ vars.LIVE_DEPLOYS }}
@@ -318,14 +330,16 @@ jobs:
     timeout-minutes: 5
     permissions: {}
     steps:
-      - id: bot
+      - name: Get release bot token
+        id: bot
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
           permission-pull-requests: write
-      - env:
+      - name: Merge as the release bot
+        env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           GH_REPO: ${{ github.repository }}
           N: ${{ github.event.pull_request.number }}
@@ -344,7 +358,8 @@ jobs:
     timeout-minutes: 2
     permissions: {}
     steps:
-      - env:
+      - name: Decide the ci result
+        env:
           LANE: ${{ needs.lane.outputs.lane }}
           RESULTS: ${{ join(needs.*.result, ' ') }}
           NEEDS: ${{ toJSON(needs) }}
@@ -357,3 +372,27 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           [[ $LANE != invalid && -n $LANE ]] || exit 1
           for r in $RESULTS; do [[ $r == success || $r == skipped ]] || exit 1; done
+
+  # Always last: one table of every job, and for each failure the failed step, the real error output
+  # and what to do next. Shown at the top of the run page.
+  report:
+    name: Run summary
+    needs: [lane, quick, hotfix-plan, hotfix-image, security, workflows, gate, ci, backmerge-merge]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      actions: read
+      checks: read
+    steps:
+      - name: Check out CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: tools/ci
+          persist-credentials: false
+      - name: Write the run summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_JOB_NAME: Run summary
+          TITLE: "PR checks · ${{ github.head_ref }} → ${{ github.base_ref }}"
+        run: node tools/ci/run-report.mjs
