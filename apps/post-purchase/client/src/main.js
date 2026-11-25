@@ -8,3 +8,4 @@ export const tweak = 1;
 export const both = 1;
 export const f = 27;
 export const o42 = 1;
+export const o52 = 1;
