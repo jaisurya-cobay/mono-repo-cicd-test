@@ -1,11 +1,9 @@
-// Stand-in for `vite build --mode <MODE>`: env-specific values are baked into the output,
-// which is why static apps are rebuilt per environment.
+// Stand-in for `vite build`. Built ONCE; nothing environment-specific is baked in.
+// Each deploy uploads these same files plus that environment's config.json (see _deploy-web.yml).
 import { mkdirSync, writeFileSync } from "node:fs";
 import { title, apiPath } from "./src/main.js";
 
-const mode = process.env.MODE ?? "development";
-const sha = process.env.GIT_SHA ?? "dev";
-mkdirSync("dist", { recursive: true });
-writeFileSync("dist/index.html", `<!doctype html><title>${title}</title><p>${title} · ${mode} · api ${apiPath}</p>\n`);
-writeFileSync("dist/version.json", JSON.stringify({ mode, sha }) + "\n");
-console.log(`built ${title} for ${mode} @ ${sha}`);
+mkdirSync("dist/assets", { recursive: true });
+writeFileSync("dist/assets/app.js", `fetch("/config.json").then((r) => r.json()).then((c) => (document.body.dataset.api = c.apiBaseUrl + "${apiPath}"));\n`);
+writeFileSync("dist/index.html", `<!doctype html><title>${title}</title><script src="/assets/app.js" defer></script><p>${title}</p>\n`);
+console.log(`built ${title}`);

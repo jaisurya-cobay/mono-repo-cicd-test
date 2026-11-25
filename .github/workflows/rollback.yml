@@ -1,0 +1,102 @@
+name: Rollback
+
+# The Rollback button: put a version that was already built back live for ONE app in ONE environment.
+# Never builds: it redeploys the stored image / web bundle for that version's content, through the
+# same reusable deploy workflows (same per-app lock, so it waits for any running deploy).
+# Rollback changes what runs, not the code: follow up with a revert or a fix.
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: App
+        required: true
+        type: choice
+        options: [post-purchase-server, post-purchase-client, post-purchase-tracking, engine-client]
+      stage:
+        description: Environment
+        required: true
+        type: choice
+        options: [production, staging, qa]
+      version:
+        description: Version tag (v1.104.0) or commit SHA to put back
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  resolve:
+    name: resolve ${{ inputs.app }} @ ${{ inputs.version }}
+    if: vars.CICD_ENABLED != 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      deployments: read
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+      server: ${{ steps.plan.outputs.server }}
+      static: ${{ steps.plan.outputs.static }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          filter: tree:0
+          persist-credentials: false
+      - id: sha
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          sha=$(git rev-parse --verify -q "$VERSION^{commit}") || { echo "::error::$VERSION is not a tag or commit in this repo"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          git checkout -q "$sha"
+      - uses: ./.github/actions/setup
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGE: ${{ inputs.stage }}
+          HEAD_SHA: ${{ steps.sha.outputs.sha }}
+          ONLY_APP: ${{ inputs.app }}
+          LIVE_DEPLOYS: ${{ vars.LIVE_DEPLOYS }}
+        run: node tools/ci/plan.mjs
+
+  server:
+    needs: resolve
+    if: needs.resolve.outputs.server != '[]'
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.server) }}
+    permissions:
+      contents: read
+      deployments: write
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/_deploy-server.yml
+    with:
+      app: ${{ matrix.app }}
+      stage: ${{ inputs.stage }}
+      sha: ${{ needs.resolve.outputs.sha }}
+      hash: ${{ matrix.hash }}
+      live: ${{ matrix.live }}
+      record: ${{ matrix.record }}
+
+  web:
+    needs: resolve
+    if: needs.resolve.outputs.static != '[]'
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.static) }}
+    permissions:
+      contents: read
+      deployments: write
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-web.yml
+    with:
+      app: ${{ matrix.app }}
+      root: ${{ matrix.root }}
+      stage: ${{ inputs.stage }}
+      sha: ${{ needs.resolve.outputs.sha }}
+      hash: ${{ matrix.hash }}
+      live: ${{ matrix.live }}
+      record: ${{ matrix.record }}

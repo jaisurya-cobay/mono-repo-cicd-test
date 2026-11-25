@@ -1,0 +1,91 @@
+name: Build image
+
+# Reusable: build one server image ONCE per content hash, scan it, attach SBOM + provenance, push.
+# Same hash already in the registry → reused, nothing built. Called by deploy.yml (qa) and ci.yml (hotfix PR).
+# Lab: GHCR. Suite: ECR (same steps, registry login swapped for OIDC + amazon-ecr-login).
+on:
+  workflow_call:
+    inputs:
+      app: { type: string, required: true }
+      root: { type: string, required: true }
+      hash: { type: string, required: true }
+      sha: { type: string, required: true }
+    outputs:
+      image:
+        value: ${{ jobs.build.outputs.image }}
+
+permissions: {}
+
+jobs:
+  build:
+    name: build ${{ inputs.app }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}/${{ inputs.app }}
+      HASH: ${{ inputs.hash }}
+    steps:
+      - id: ref
+        run: echo "image=$IMAGE:$HASH" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: exists
+        env:
+          REF: ${{ steps.ref.outputs.image }}
+        run: |
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "::notice::$REF already built, reusing it"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.exists.outputs.found != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - if: steps.exists.outputs.found != 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      # Layer cache lives in the registry next to the image: unchanged apt/npm layers are pulled,
+      # only the source layer is rebuilt. SBOM + provenance are attached to the image itself.
+      - if: steps.exists.outputs.found != 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ${{ inputs.root }}/Dockerfile
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: |
+            ${{ steps.ref.outputs.image }}
+            ${{ env.IMAGE }}:sha-${{ inputs.sha }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
+      # Vulnerability DB downloaded at most once a day.
+      - if: steps.exists.outputs.found != 'true'
+        id: day
+        run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - if: steps.exists.outputs.found != 'true'
+        # Holds only the public Trivy vulnerability DB, never build output.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # zizmor: ignore[cache-poisoning] (v6)
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ steps.day.outputs.day }}
+          restore-keys: trivy-db-
+      - if: steps.exists.outputs.found != 'true'
+        name: Scan (Trivy, report-only)
+        continue-on-error: true
+        env:
+          REF: ${{ steps.ref.outputs.image }}
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        run: |
+          docker run --rm -v ~/.cache/trivy:/root/.cache/trivy -e TRIVY_USERNAME -e TRIVY_PASSWORD aquasec/trivy:0.74.0 \
+            image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --format table "$REF" | tee trivy.txt
+          { echo "### Trivy: \`${REF##*/}\`"; echo '```'; tail -n 40 trivy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

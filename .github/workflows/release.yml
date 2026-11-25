@@ -1,0 +1,85 @@
+name: Release
+
+# The Release button. Anyone with write access may press it; the checks decide, not the person.
+# Preflight changes nothing. If every check passes, the release bot merges the one open PR into
+# master (people cannot: the Merge button is blocked by the master ruleset). The push to master
+# then runs deploy.yml: production deploy, version tag, GitHub Release, back-merge.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+# Pressing twice: the second run waits, finds nothing open, and ends green.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: preflight + merge
+    if: vars.CICD_ENABLED != 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      deployments: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          filter: tree:0
+          persist-credentials: false
+      - id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prs=$(gh pr list --base master --state open --json number,headRefName,isDraft,reviewDecision,mergeable,statusCheckRollup,headRefOid,baseRefOid,title)
+          count=$(jq length <<<"$prs")
+          if [[ $count == 0 ]]; then
+            echo "### Nothing to release: no open PR into master" >> "$GITHUB_STEP_SUMMARY"
+            echo "none=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          fail() { echo "::error title=Preflight::$1"; echo "### ❌ Preflight: $1 (nothing was changed)" >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          [[ $count == 1 ]] || fail "$count PRs are open into master. Leave exactly one."
+          pr=$(jq '.[0]' <<<"$prs")
+          n=$(jq -r .number <<<"$pr"); head=$(jq -r .headRefName <<<"$pr")
+          [[ $head == staging || $head == hotfix/* ]] || fail "PR #$n comes from $head. master takes only staging or hotfix/*."
+          [[ $(jq -r .isDraft <<<"$pr") == false ]] || fail "PR #$n is a draft."
+          [[ $(jq -r .reviewDecision <<<"$pr") == APPROVED ]] || fail "PR #$n is not approved."
+          [[ $(jq -r .mergeable <<<"$pr") == MERGEABLE ]] || fail "PR #$n has conflicts or can't be merged yet."
+          ci=$(jq -r '[.statusCheckRollup[] | select(.name == "ci")][0].conclusion // "MISSING"' <<<"$pr")
+          [[ $ci == SUCCESS ]] || fail "PR #$n: required check ci is $ci."
+          { echo "number=$n"; echo "head=$head"; echo "head_sha=$(jq -r .headRefOid <<<"$pr")"; echo "base_sha=$(jq -r .baseRefOid <<<"$pr")"; } >> "$GITHUB_OUTPUT"
+          echo "### Release PR #$n ($head): approved, ci green" >> "$GITHUB_STEP_SUMMARY"
+      # A normal release: staging must already run this exact code, and must hold every hotfix.
+      # Hotfixes skip this (they never went through staging).
+      - if: steps.pr.outputs.head == 'staging'
+        uses: ./.github/actions/setup
+      - if: steps.pr.outputs.head == 'staging'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOWER_ENV: staging
+          LIVE_DEPLOYS: ${{ vars.LIVE_DEPLOYS }}
+          BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          git fetch --no-tags origin master
+          node tools/ci/gate.mjs
+      - if: steps.pr.outputs.number != ''
+        id: bot
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Bot merges
+        if: steps.pr.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          N: ${{ steps.pr.outputs.number }}
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          # --match-head-commit: nothing pushed after preflight sneaks in.
+          gh pr merge "$N" --merge --match-head-commit "$HEAD_SHA"
+          echo "### ✅ Merged #$N. deploy.yml now ships it to production." >> "$GITHUB_STEP_SUMMARY"

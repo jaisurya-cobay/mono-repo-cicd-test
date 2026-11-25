@@ -3,17 +3,17 @@ description: pnpm + Node from the repo pins, restored pnpm store and Nx cache, f
 runs:
   using: composite
   steps:
-    - uses: pnpm/action-setup@v6
+    - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
       with:
         run_install: false
 
-    - uses: actions/setup-node@v6
+    - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
       with:
         node-version-file: .nvmrc
         cache: pnpm
 
     # Nx task results carry over between runs: unchanged projects restore instead of re-running.
-    - uses: actions/cache@v6
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
       with:
         path: .nx/cache
         key: nx-${{ runner.os }}-${{ github.sha }}

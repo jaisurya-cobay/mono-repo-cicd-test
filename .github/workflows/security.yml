@@ -1,0 +1,64 @@
+name: Security
+
+# Nightly: re-scan the images that are live right now, so CVEs published after a release are found
+# without rebuilding. Report-only: findings go to the run summary (suite: + Slack on a fixable CRITICAL).
+# DAST is a separate manual workflow (dast.yml) against staging.
+on:
+  schedule:
+    - cron: "30 20 * * *"   # 02:00 IST
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  live:
+    name: find live images
+    if: vars.CICD_ENABLED != 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      deployments: read
+    outputs:
+      images: ${{ steps.find.outputs.images }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup
+      - id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LIVE_DEPLOYS: ${{ vars.LIVE_DEPLOYS }}
+        run: node tools/ci/live-images.mjs
+
+  scan:
+    name: scan ${{ matrix.stage }} ${{ matrix.app }}
+    needs: live
+    if: needs.live.outputs.images != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.live.outputs.images) }}
+    steps:
+      - id: day
+        run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ steps.day.outputs.day }}
+          restore-keys: trivy-db-
+      - env:
+          REF: ${{ matrix.image }}
+          STAGE: ${{ matrix.stage }}
+          APP: ${{ matrix.app }}
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ github.token }}
+        run: |
+          docker run --rm -v ~/.cache/trivy:/root/.cache/trivy -e TRIVY_USERNAME -e TRIVY_PASSWORD aquasec/trivy:0.74.0 \
+            image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --format table "$REF" | tee trivy.txt
+          { echo "### $STAGE · $APP"; echo '```'; tail -n 40 trivy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

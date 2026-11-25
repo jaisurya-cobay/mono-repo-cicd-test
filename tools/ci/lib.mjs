@@ -54,6 +54,19 @@ export function contentHash(projectName, ref = "HEAD") {
   return createHash("sha256").update(parts.join("\n")).digest("hex").slice(0, 16);
 }
 
+// Live switch per app and environment, from the repo variable LIVE_DEPLOYS, e.g.
+// {"post-purchase-tracking":["qa","staging"]}. Anything not listed deploys as a dry run.
+// Dry runs are recorded under "<stage>-dryrun", so they never count as a real deploy: the first
+// live deploy after cutover is never skipped as "unchanged".
+export function isLive(slug, stage) {
+  try {
+    return (JSON.parse(process.env.LIVE_DEPLOYS || "{}")[slug] ?? []).includes(stage);
+  } catch {
+    throw new Error("LIVE_DEPLOYS is not valid JSON");
+  }
+}
+export const recordEnv = (slug, stage) => (isLive(slug, stage) ? stage : `${stage}-dryrun`);
+
 export function output(key, value) {
   if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${key}<<EOF\n${value}\nEOF\n`);
   else console.log(`${key}=${value}`);
