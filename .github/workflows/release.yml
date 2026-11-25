@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   release:
-    name: preflight + merge
+    name: "Release: preflight, then bot merges"
     if: vars.CICD_ENABLED != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 15

@@ -20,18 +20,31 @@ concurrency:
 
 jobs:
   lane:
-    name: lane
+    name: Route PR
     runs-on: ubuntu-24.04
     timeout-minutes: 2
-    permissions: {}
+    permissions:
+      pull-requests: read
     outputs:
       lane: ${{ steps.lane.outputs.lane }}
+      workflows: ${{ steps.files.outputs.workflows }}
     steps:
+      # One API call, no checkout: did this PR touch .github/? Only then do workflow files get linted.
+      - id: files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          N: ${{ github.event.pull_request.number }}
+        run: |
+          n=$(gh api "repos/$GH_REPO/pulls/$N/files" --paginate --jq '[.[] | select(.filename | startswith(".github/"))] | length' | awk '{s+=$1} END {print s+0}')
+          echo "workflows=$([[ ${n:-0} -gt 0 ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "count=${n:-0}" >> "$GITHUB_OUTPUT"
       - id: lane
         env:
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
           DRAFT: ${{ github.event.pull_request.draft }}
+          GH_FILES: ${{ steps.files.outputs.count }}
         run: |
           case "$BASE_REF:$HEAD_REF" in
             *:backmerge/*)                lane=backmerge ;;
@@ -43,14 +56,29 @@ jobs:
           esac
           [[ $DRAFT == true ]] && lane=draft
           echo "lane=$lane" >> "$GITHUB_OUTPUT"
-          echo "### Lane: \`$lane\` ($HEAD_REF → $BASE_REF)" >> "$GITHUB_STEP_SUMMARY"
+          case $lane in
+            fast)      runs="title · lint · types · tests on changed apps · back-merge guard · security scan" ;;
+            promotion) runs="promotion gate only: the code already runs green one environment lower" ;;
+            hotfix)    runs="title (patch types) · lint · types · tests · integration · image build · security scan" ;;
+            backmerge) runs="lint · types · tests on the merged result; the bot merges it when green" ;;
+            draft)     runs="nothing until Ready for review" ;;
+            invalid)   runs="nothing: this route is not allowed" ;;
+          esac
+          {
+            echo "### Route PR"
+            echo "| | |"; echo "|---|---|"
+            echo "| Route | \`$HEAD_REF\` → \`$BASE_REF\` |"
+            echo "| Lane | **$lane** |"
+            echo "| Runs | $runs |"
+            echo "| Workflow files changed | $GH_FILES file(s) in .github/ → lint $([[ $GH_FILES -gt 0 ]] && echo runs || echo skipped) |"
+          } >> "$GITHUB_STEP_SUMMARY"
           if [[ $lane == invalid ]]; then
             echo "::error::$HEAD_REF → $BASE_REF is not allowed. qa takes feature branches; staging takes only qa; master takes only staging and hotfix/*."
           fi
 
   # Title, affected lint/typecheck/test, back-merge guard. One job: one install, one runner.
   quick:
-    name: quick check
+    name: "Checks: title · lint · types · tests"
     needs: lane
     if: contains(fromJSON('["fast","hotfix","backmerge"]'), needs.lane.outputs.lane)
     runs-on: ubuntu-24.04
@@ -65,18 +93,30 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup
       - name: PR title
+        id: title
         if: needs.lane.outputs.lane != 'backmerge'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
           LANE: ${{ needs.lane.outputs.lane }}
         run: node tools/ci/title.mjs
-      - name: Lint, typecheck, unit tests (affected only)
+      - name: Which apps changed
+        id: affected
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          list=$(pnpm exec nx show projects --affected --base="$BASE_SHA" --head=HEAD | sed 's#^@[^/]*/##' | paste -sd, -)
+          echo "list=${list:-none}" >> "$GITHUB_OUTPUT"
+          echo "Affected: ${list:-none}"
+      - name: Lint, typecheck, unit tests (changed apps only)
+        id: tests
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: pnpm exec nx affected -t lint typecheck test --base="$BASE_SHA" --head=HEAD --outputStyle=static
       - name: CI tooling tests
+        id: tooling
         run: node --test "tools/ci/*.test.mjs"
       - name: Back-merge guard
+        id: guard
         if: needs.lane.outputs.lane == 'fast'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -85,15 +125,38 @@ jobs:
           node tools/ci/guard.mjs
       # A hotfix skips qa and staging, so it also runs what a qa merge would run before deploying.
       - name: Integration tests (hotfix only)
+        id: integration
         if: needs.lane.outputs.lane == 'hotfix'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: pnpm exec nx affected -t integration --base="$BASE_SHA" --head=HEAD --outputStyle=static
+      - name: Report
+        if: always()
+        env:
+          TITLE: ${{ steps.title.outcome }}
+          AFFECTED: ${{ steps.affected.outputs.list }}
+          TESTS: ${{ steps.tests.outcome }}
+          TOOLING: ${{ steps.tooling.outcome }}
+          GUARD: ${{ steps.guard.outcome }}
+          INTEGRATION: ${{ steps.integration.outcome }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          icon() { case $1 in success) echo "✅ passed" ;; failure) echo "❌ failed" ;; skipped|"") echo "⏭️ skipped" ;; *) echo "⚠️ $1" ;; esac; }
+          {
+            echo "### Checks"
+            echo "| Check | Result | What it covers |"; echo "|---|---|---|"
+            echo "| PR title | $(icon "$TITLE") | \`$PR_TITLE\` |"
+            echo "| Changed apps | — | ${AFFECTED:-none} |"
+            echo "| Lint · types · unit tests | $(icon "$TESTS") | only the changed apps above |"
+            echo "| CI tooling tests | $(icon "$TOOLING") | version, title and guard rules |"
+            echo "| Back-merge guard | $(icon "$GUARD") | PR has every hotfix it overlaps with |"
+            echo "| Integration tests | $(icon "$INTEGRATION") | hotfix only (it skips qa and staging) |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Hotfix image is built on the PR, so the production deploy reuses it instead of building.
   # Only after the title and tests pass, so a rejected hotfix never spends a build.
   hotfix-plan:
-    name: hotfix plan
+    name: "Hotfix: find images to build"
     needs: [lane, quick]
     if: needs.lane.outputs.lane == 'hotfix' && needs.quick.result == 'success'
     runs-on: ubuntu-24.04
@@ -115,7 +178,7 @@ jobs:
         run: node tools/ci/hotfix-plan.mjs
 
   hotfix-image:
-    name: hotfix image (${{ matrix.app }})
+    name: Hotfix image · ${{ matrix.app }}
     needs: hotfix-plan
     if: needs.hotfix-plan.outputs.server != '[]' && needs.hotfix-plan.outputs.server != ''
     strategy:
@@ -134,7 +197,7 @@ jobs:
   # Report-only for now: findings show on the run, never fail ci. Made blocking later by
   # requiring this job's check in the ruleset.
   security:
-    name: security (report-only)
+    name: Security scan (report only)
     needs: lane
     if: contains(fromJSON('["fast","hotfix"]'), needs.lane.outputs.lane)
     runs-on: ubuntu-24.04
@@ -149,24 +212,43 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Secrets in this PR's commits (TruffleHog)
+        id: secrets
+        continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: >-
           docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/repo" trufflesecurity/trufflehog:3.99.8
           git file:///repo --since-commit "$BASE_SHA" --branch HEAD --results=verified --fail --no-update
-      - name: SAST on changed files (Semgrep)
+      - name: Code patterns in changed files (Semgrep)
+        id: sast
+        continue-on-error: true
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           mapfile -t files < <(git diff --name-only --diff-filter=d "$BASE_SHA"...HEAD -- '*.js' '*.mjs' '*.ts' '*.vue' '*.py')
+          echo "files=${#files[@]}" >> "$GITHUB_OUTPUT"
           if [[ ${#files[@]} -eq 0 ]]; then echo "No source files changed"; exit 0; fi
           docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep:1.178.0 semgrep scan --config p/default --error --quiet "${files[@]}"
+      - name: Report
+        if: always()
+        env:
+          SECRETS: ${{ steps.secrets.outcome }}
+          SAST: ${{ steps.sast.outcome }}
+          FILES: ${{ steps.sast.outputs.files }}
+        run: |
+          r() { case $1 in success) echo "✅ nothing found" ;; failure) echo "⚠️ findings (see log above)" ;; *) echo "⏭️ $1" ;; esac; }
+          {
+            echo "### Security scan (report only: never blocks the PR)"
+            echo "| Scan | Result | Scope |"; echo "|---|---|---|"
+            echo "| Live secrets (TruffleHog) | $(r "$SECRETS") | commits in this PR, verified secrets only |"
+            echo "| Risky code (Semgrep) | $(r "$SAST") | ${FILES:-0} changed source file(s) |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Workflow files are code too: lint them whenever they change.
   workflows:
-    name: workflow lint
+    name: Lint workflow files
     needs: lane
-    if: needs.lane.outputs.lane != 'draft' && needs.lane.outputs.lane != 'invalid'
+    if: needs.lane.outputs.workflows == 'true' && needs.lane.outputs.lane != 'draft' && needs.lane.outputs.lane != 'invalid'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -174,22 +256,29 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
-          filter: tree:0
           persist-credentials: false
-      - id: changed
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: echo "any=$(git diff --name-only "$BASE_SHA"...HEAD -- .github | head -1 | wc -l)" >> "$GITHUB_OUTPUT"
-      - name: actionlint
-        if: steps.changed.outputs.any == '1'
+      - name: Syntax and expressions (actionlint)
+        id: actionlint
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
-      - name: zizmor
-        if: steps.changed.outputs.any == '1'
+      - name: Security of workflows (zizmor)
+        id: zizmor
         run: pipx run zizmor==1.9.0 --min-severity medium .github/workflows
+      - name: Report
+        if: always()
+        env:
+          A: ${{ steps.actionlint.outcome }}
+          Z: ${{ steps.zizmor.outcome }}
+        run: |
+          r() { [[ $1 == success ]] && echo "✅ clean" || echo "❌ $1 (see log above)"; }
+          {
+            echo "### Lint workflow files (runs only when .github/ changes)"
+            echo "| Tool | Result | Checks |"; echo "|---|---|---|"
+            echo "| actionlint | $(r "$A") | YAML, expressions, job wiring, shell in run steps |"
+            echo "| zizmor | $(r "$Z") | injection, unpinned actions, token and permission risks |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   gate:
-    name: gate
+    name: Promotion gate
     needs: lane
     if: needs.lane.outputs.lane == 'promotion'
     runs-on: ubuntu-24.04
@@ -219,7 +308,7 @@ jobs:
   # GitHub auto-merge would wait forever for the human approval the ruleset asks for. Only when the
   # bot made the latest push: once a person pushes (e.g. resolving a conflict), a person merges it.
   backmerge-merge:
-    name: merge back-merge
+    name: "Bot: merge back-merge"
     needs: [lane, ci]
     if: >-
       needs.lane.outputs.lane == 'backmerge' && needs.ci.result == 'success' &&
@@ -241,9 +330,12 @@ jobs:
           GH_REPO: ${{ github.repository }}
           N: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: gh pr merge "$N" --merge --admin --match-head-commit "$HEAD_SHA"
+        run: |
+          gh pr merge "$N" --merge --admin --match-head-commit "$HEAD_SHA"
+          echo "### Bot merged back-merge PR #$N (ci green, latest push by the bot)" >> "$GITHUB_STEP_SUMMARY"
 
-  # The only required status check. Passes when every job that ran passed (security is report-only).
+  # The only required status check (the rulesets and Release preflight look it up by the name "ci").
+  # Passes when every job that ran passed; security is report-only.
   ci:
     name: ci
     needs: [lane, quick, hotfix-plan, hotfix-image, workflows, gate]
@@ -255,7 +347,13 @@ jobs:
       - env:
           LANE: ${{ needs.lane.outputs.lane }}
           RESULTS: ${{ join(needs.*.result, ' ') }}
+          NEEDS: ${{ toJSON(needs) }}
         run: |
           echo "lane=$LANE results=$RESULTS"
+          {
+            echo "### ci (required): lane **${LANE:-unknown}**"
+            echo "| Job | Result |"; echo "|---|---|"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.result | if . == "success" then "✅ passed" elif . == "skipped" then "⏭️ not needed" else "❌ " + . end) |"' <<<"$NEEDS"
+          } >> "$GITHUB_STEP_SUMMARY"
           [[ $LANE != invalid && -n $LANE ]] || exit 1
           for r in $RESULTS; do [[ $r == success || $r == skipped ]] || exit 1; done
