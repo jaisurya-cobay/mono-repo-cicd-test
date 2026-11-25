@@ -6,3 +6,4 @@ export const apiPath = `/${API_VERSION}`;
 export const banner = "lab banner";
 export const tweak = 1;
 export const both = 1;
+export const f = 27;
