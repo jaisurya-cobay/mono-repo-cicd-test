@@ -93,3 +93,27 @@ jobs:
           # --match-head-commit: nothing pushed after preflight sneaks in.
           gh pr merge "$N" --merge --admin --match-head-commit "$HEAD_SHA"
           echo "### ✅ Merged #$N. deploy.yml now ships it to production." >> "$GITHUB_STEP_SUMMARY"
+
+  # Always last: one table of every job, and for each failure the failed step, the real error output
+  # and what to do next. Shown at the top of the run page.
+  report:
+    name: Run summary
+    needs: [release]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      actions: read
+      checks: read
+    steps:
+      - name: Check out CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: tools/ci
+          persist-credentials: false
+      - name: Write the run summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_JOB_NAME: Run summary
+          TITLE: "Release"
+        run: node tools/ci/run-report.mjs
