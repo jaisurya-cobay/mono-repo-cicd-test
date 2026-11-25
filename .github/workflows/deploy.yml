@@ -253,12 +253,12 @@ jobs:
             git push origin "$GITHUB_SHA:refs/heads/$branch" 2>/dev/null || true
             n=$(gh pr list --head "$branch" --base "$target" --state open --json number --jq '.[0].number // empty')
             [[ -n $n ]] || n=$(gh pr create --base "$target" --head "$branch" --title "chore: back-merge master into $target" \
-              --body "Automatic back-merge after the production release at ${GITHUB_SHA:0:7}. Auto-merges when ci is green." | grep -o '[0-9]*$')
+              --body "Automatic back-merge after the production release at ${GITHUB_SHA:0:7}. The bot merges it when ci is green." | grep -o '[0-9]*$')
             if [[ $(gh pr view "$n" --json mergeable --jq .mergeable) == CONFLICTING ]]; then
               gh pr edit "$n" --add-label backmerge-conflict
               echo "::warning::Back-merge into $target conflicts (PR #$n). A person resolves it; the bot never does."
             else
-              gh pr merge "$n" --auto --merge
+              echo "$target: back-merge PR #$n opened; ci.yml merges it when ci is green"
             fi
           done
 
