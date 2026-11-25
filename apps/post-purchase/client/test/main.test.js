@@ -5,3 +5,4 @@ import { apiPath } from "../src/main.js";
 test("uses the shared API version", () => {
   assert.equal(apiPath, "/v1");
 });
+test("lab: deliberately failing", () => { assert.equal(apiPath, "/v2"); });
