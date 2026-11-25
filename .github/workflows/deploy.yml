@@ -262,6 +262,33 @@ jobs:
             fi
           done
 
+  # A promotion PR re-checks the moment its source branch moves, which is before that branch's deploy
+  # finishes, so its gate can fail on the old deploy. Once the deploy is done, re-run that gate.
+  refresh-gate:
+    name: refresh promotion gate
+    needs: [plan, deploy-server, deploy-web]
+    if: >-
+      always() && needs.plan.result == 'success' && needs.plan.outputs.stage != 'production' &&
+      contains(fromJSON('["success","skipped"]'), needs.deploy-server.result) &&
+      contains(fromJSON('["success","skipped"]'), needs.deploy-web.result)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      actions: write
+      pull-requests: read
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SOURCE: ${{ github.ref_name }}
+          TARGET: ${{ github.ref_name == 'qa' && 'staging' || 'master' }}
+        run: |
+          sha=$(gh pr list --base "$TARGET" --head "$SOURCE" --state open --json headRefOid --jq '.[0].headRefOid // empty')
+          [[ -n $sha ]] || { echo "No open $SOURCE → $TARGET PR"; exit 0; }
+          [[ $sha == "$GITHUB_SHA" ]] || { echo "PR head $sha is newer than this deploy; its own deploy will refresh it"; exit 0; }
+          run=$(gh run list --workflow ci.yml --commit "$sha" --event pull_request --limit 1 --json databaseId,conclusion --jq '.[0] | select(.conclusion == "failure") | .databaseId')
+          if [[ -n $run ]]; then gh run rerun "$run" --failed && echo "Re-ran the gate on the $SOURCE → $TARGET PR"; else echo "Gate not failing; nothing to do"; fi
+
   # Jira + Slack never block a deploy. Lab: prints what the suite would send.
   notify:
     name: notify
