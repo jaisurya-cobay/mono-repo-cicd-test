@@ -26,7 +26,7 @@ permissions: {}
 
 jobs:
   resolve:
-    name: resolve ${{ inputs.app }} @ ${{ inputs.version }}
+    name: Find ${{ inputs.app }} @ ${{ inputs.version }}
     if: vars.CICD_ENABLED != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -61,6 +61,7 @@ jobs:
         run: node tools/ci/plan.mjs
 
   server:
+    name: Roll back · ${{ inputs.app }}
     needs: resolve
     if: needs.resolve.outputs.server != '[]'
     strategy:
@@ -81,6 +82,7 @@ jobs:
       record: ${{ matrix.record }}
 
   web:
+    name: Roll back · ${{ inputs.app }}
     needs: resolve
     if: needs.resolve.outputs.static != '[]'
     strategy:

@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   plan:
-    name: plan
+    name: "Plan: what changed"
     if: vars.CICD_ENABLED != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -57,7 +57,7 @@ jobs:
 
   # QA only. staging and production promote code that already passed here (the gate proves it).
   test:
-    name: full tests
+    name: Full tests (qa only)
     needs: plan
     if: needs.plan.outputs.any == 'true' && needs.plan.outputs.stage == 'qa'
     runs-on: ubuntu-24.04
@@ -69,12 +69,20 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup
-      - env:
+      - name: Lint, types, unit and integration tests for the apps being deployed
+        env:
           PROJECTS: ${{ needs.plan.outputs.projects }}
-        run: pnpm exec nx run-many -t lint typecheck test integration -p "$PROJECTS" --outputStyle=static
+        run: |
+          pnpm exec nx run-many -t lint typecheck test integration -p "$PROJECTS" --outputStyle=static
+          {
+            echo "### Full tests (qa only)"
+            echo "Ran lint, types, unit and integration tests for: \`${PROJECTS//,/\`, \`}\`"
+            echo ""
+            echo "staging and production skip this: the promotion gate proves they get code that passed here."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   image:
-    name: image
+    name: Build image · ${{ matrix.app }}
     needs: [plan, test]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.server != '[]' && contains(fromJSON('["success","skipped"]'), needs.test.result)
     strategy:
@@ -92,7 +100,7 @@ jobs:
 
   # Web bundles: built ONCE per content hash, stored, reused by every environment.
   web-build:
-    name: web build (${{ matrix.app }})
+    name: Build web · ${{ matrix.app }}
     needs: [plan, test]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.static != '[]' && contains(fromJSON('["success","skipped"]'), needs.test.result)
     runs-on: ubuntu-24.04
@@ -126,11 +134,25 @@ jobs:
           name: web-${{ matrix.app }}-${{ matrix.hash }}
           path: ${{ matrix.root }}/dist
           retention-days: 90
-      - if: steps.stored.outputs.id != ''
-        run: echo "::notice::web-$APP-$HASH already built, reusing it"
+      - name: Report
+        if: always()
+        env:
+          STORED: ${{ steps.stored.outputs.id }}
+        run: |
+          {
+            echo "### Build web · $APP"
+            echo "| | |"; echo "|---|---|"
+            echo "| Content hash | \`$HASH\` |"
+            if [[ -n $STORED ]]; then
+              echo "| Result | ♻️ reused: already built for this exact code (artifact $STORED), nothing built |"
+            else
+              echo "| Result | 🔨 built once and stored as \`web-$APP-$HASH\` (kept 90 days) |"
+            fi
+            echo "| Next | every environment deploys these same files; only config.json differs |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   deploy-server:
-    name: server
+    name: Deploy · ${{ matrix.app }}
     needs: [plan, image]
     if: always() && needs.image.result == 'success'
     strategy:
@@ -153,7 +175,7 @@ jobs:
 
   # After the server, so a client never goes live against an API that isn't there yet.
   deploy-web:
-    name: web
+    name: Deploy · ${{ matrix.app }}
     needs: [plan, image, web-build, deploy-server]
     if: >-
       always() && needs.web-build.result == 'success' &&
@@ -181,7 +203,7 @@ jobs:
   # staging: rc tag + open/update the Release PR. master: release tag + GitHub Release + back-merge.
   # Runs only when nothing failed. Every step is safe to re-run.
   version:
-    name: version
+    name: Version & release
     needs: [plan, deploy-server, deploy-web]
     if: >-
       always() && needs.plan.result == 'success' && needs.plan.outputs.stage != 'qa' &&
@@ -269,7 +291,7 @@ jobs:
   # A promotion PR re-checks the moment its source branch moves, which is before that branch's deploy
   # finishes, so its gate can fail on the old deploy. Once the deploy is done, re-run that gate.
   refresh-gate:
-    name: refresh promotion gate
+    name: Re-check promotion PR
     needs: [plan, deploy-server, deploy-web]
     if: >-
       always() && needs.plan.result == 'success' && needs.plan.outputs.stage != 'production' &&
@@ -291,11 +313,17 @@ jobs:
           [[ -n $sha ]] || { echo "No open $SOURCE → $TARGET PR"; exit 0; }
           [[ $sha == "$GITHUB_SHA" ]] || { echo "PR head $sha is newer than this deploy; its own deploy will refresh it"; exit 0; }
           run=$(gh run list --workflow ci.yml --commit "$sha" --event pull_request --limit 1 --json databaseId,conclusion --jq '.[0] | select(.conclusion == "failure") | .databaseId')
-          if [[ -n $run ]]; then gh run rerun "$run" --failed && echo "Re-ran the gate on the $SOURCE → $TARGET PR"; else echo "Gate not failing; nothing to do"; fi
+          if [[ -n $run ]]; then
+            gh run rerun "$run" --failed
+            msg="🔁 the $SOURCE → $TARGET PR's gate had failed before this deploy finished; re-ran it"
+          else
+            msg="✅ the $SOURCE → $TARGET PR's gate is not failing; nothing to do"
+          fi
+          echo "$msg"; echo "### Re-check promotion PR"$'\n'"$msg" >> "$GITHUB_STEP_SUMMARY"
 
   # Jira + Slack never block a deploy. Lab: prints what the suite would send.
   notify:
-    name: notify
+    name: Notify Jira & Slack
     needs: [plan, deploy-server, deploy-web, version]
     if: always() && needs.plan.outputs.any == 'true'
     runs-on: ubuntu-24.04
