@@ -216,14 +216,15 @@ jobs:
           node tools/ci/gate.mjs
 
   # Bot back-merge PRs: once ci is green, the release bot merges them with its bypass, because
-  # GitHub auto-merge would wait forever for the human approval the ruleset asks for. Conflicts never
-  # get here (they fail ci or stay unmergeable); a person resolves those.
+  # GitHub auto-merge would wait forever for the human approval the ruleset asks for. Only when the
+  # bot made the latest push: once a person pushes (e.g. resolving a conflict), a person merges it.
   backmerge-merge:
     name: merge back-merge
     needs: [lane, ci]
     if: >-
       needs.lane.outputs.lane == 'backmerge' && needs.ci.result == 'success' &&
-      endsWith(github.event.pull_request.user.login, '[bot]')
+      endsWith(github.event.pull_request.user.login, '[bot]') &&
+      endsWith(github.event.sender.login, '[bot]')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
