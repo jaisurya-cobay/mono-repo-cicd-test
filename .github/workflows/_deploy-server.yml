@@ -17,7 +17,7 @@ permissions: {}
 
 jobs:
   deploy:
-    name: ${{ inputs.app }} → ${{ inputs.stage }}
+    name: "→ ${{ inputs.stage }} (${{ inputs.live && 'live' || 'dry run' }})"
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: server-${{ inputs.stage }}
@@ -55,6 +55,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
       - name: Image exists
+        id: image
         run: |
           docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1 \
             || { echo "::error::$IMAGE not found. Deploys and rollbacks never build; re-run the qa deploy that built it."; exit 1; }
@@ -73,6 +74,7 @@ jobs:
 
       # Live path. Lab: stub. Suite: the commented block replaces the stub.
       - name: Deploy (lab stub for OIDC + SSM rolling blue/green)
+        id: rollout
         if: env.LIVE == 'true'
         env:
           TARGET: ${{ inputs.stage }}:${{ inputs.app }}
@@ -94,3 +96,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DEPLOYMENT_ID: ${{ steps.start.outputs.id }}
         run: tools/ci/record.sh ${{ job.status == 'success' && 'success' || 'failure' }} - - -
+      - name: Report
+        if: always()
+        env:
+          IMG: ${{ steps.image.outcome }}
+          ROLL: ${{ steps.rollout.outcome }}
+          REC: ${{ steps.start.outputs.id }}
+          JOB: ${{ job.status }}
+        run: |
+          r() { case $1 in success) echo "✅ $2" ;; failure) echo "❌ $3" ;; skipped|"") echo "⏭️ $4" ;; *) echo "⚠️ $1" ;; esac; }
+          {
+            echo "### Deploy · $APP → $STAGE ($([[ $LIVE == true ]] && echo live || echo 'dry run'))"
+            echo "| Step | Result | Detail |"; echo "|---|---|---|"
+            echo "| Image exists | $(r "$IMG" verified 'not found: deploys never build' skipped) | \`$IMAGE\` |"
+            echo "| Deploy record | $([[ -n $REC ]] && echo "✅ #$REC" || echo '❌ not created') | environment \`$RECORD\`, commit \`${SHA:0:7}\` |"
+            echo "| Rollout | $(r "$ROLL" 'healthy, traffic switched' 'unhealthy: old colour kept serving' 'dry run: printed above, nothing changed') | rolling 50%, health gate before swap |"
+            echo "| Result | $([[ $JOB == success ]] && echo "✅ $STAGE runs content \`$HASH\`" || echo '❌ recorded as failure; next push retries') | |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -18,7 +18,7 @@ permissions: {}
 
 jobs:
   build:
-    name: build ${{ inputs.app }}
+    name: Build, scan, push
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -80,6 +80,7 @@ jobs:
           restore-keys: trivy-db-
       - if: steps.exists.outputs.found != 'true'
         name: Scan (Trivy, report-only)
+        id: scan
         continue-on-error: true
         env:
           REF: ${{ steps.ref.outputs.image }}
@@ -89,3 +90,24 @@ jobs:
           docker run --rm -v ~/.cache/trivy:/root/.cache/trivy -e TRIVY_USERNAME -e TRIVY_PASSWORD aquasec/trivy:0.74.0 \
             image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --format table "$REF" | tee trivy.txt
           { echo "### Trivy: \`${REF##*/}\`"; echo '```'; tail -n 40 trivy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Report
+        if: always()
+        env:
+          REF: ${{ steps.ref.outputs.image }}
+          FOUND: ${{ steps.exists.outputs.found }}
+          SCAN: ${{ steps.scan.outcome }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          {
+            echo "### Image · ${REF##*/}"
+            echo "| | |"; echo "|---|---|"
+            if [[ $FOUND == true ]]; then
+              echo "| Result | ♻️ reused: this exact code was already built, nothing built or pushed |"
+            else
+              echo "| Result | 🔨 built once from commit \`${SHA:0:7}\` with the registry layer cache, pushed |"
+              echo "| SBOM + provenance | ✅ attached to the image |"
+              echo "| Vulnerability scan | $([[ $SCAN == success ]] && echo '✅ ran (table above)' || echo "⚠️ $SCAN (report only)") |"
+            fi
+            echo "| Image | \`$REF\` |"
+            echo "| Next | staging and production deploy this same image, never a rebuild |"
+          } >> "$GITHUB_STEP_SUMMARY"

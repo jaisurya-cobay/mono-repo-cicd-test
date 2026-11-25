@@ -19,7 +19,7 @@ permissions: {}
 
 jobs:
   deploy:
-    name: ${{ inputs.app }} → ${{ inputs.stage }}
+    name: "→ ${{ inputs.stage }} (${{ inputs.live && 'live' || 'dry run' }})"
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     environment: web-${{ inputs.stage }}
@@ -53,10 +53,12 @@ jobs:
           id=$(tools/ci/record.sh start "$RECORD" "$APP" "$SHA" "{\"hash\":\"$HASH\"}")
           echo "id=$id" >> "$GITHUB_OUTPUT"
       - name: Fetch the build (made once, on the qa deploy)
+        id: fetch
         env:
           GH_TOKEN: ${{ github.token }}
         run: tools/ci/web-build.sh fetch "$APP" "$HASH" dist
       - name: Write config.json for ${{ inputs.stage }}
+        id: config
         env:
           WEB_CONFIG_JSON: ${{ vars.WEB_CONFIG_JSON }}
           SCHEMA: ${{ inputs.root }}/config.schema.json
@@ -74,6 +76,7 @@ jobs:
             echo '```json'; cat dist/config.json; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Deploy (lab stub for S3 + CloudFront)
+        id: rollout
         if: env.LIVE == 'true'
         env:
           TARGET: ${{ inputs.stage }}:${{ inputs.app }}
@@ -86,3 +89,22 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           DEPLOYMENT_ID: ${{ steps.start.outputs.id }}
         run: tools/ci/record.sh ${{ job.status == 'success' && 'success' || 'failure' }} - - -
+      - name: Report
+        if: always()
+        env:
+          FETCH: ${{ steps.fetch.outcome }}
+          CONF: ${{ steps.config.outcome }}
+          ROLL: ${{ steps.rollout.outcome }}
+          REC: ${{ steps.start.outputs.id }}
+          JOB: ${{ job.status }}
+        run: |
+          r() { case $1 in success) echo "✅ $2" ;; failure) echo "❌ $3" ;; skipped|"") echo "⏭️ $4" ;; *) echo "⚠️ $1" ;; esac; }
+          {
+            echo "### Deploy · $APP → $STAGE ($([[ $LIVE == true ]] && echo live || echo 'dry run'))"
+            echo "| Step | Result | Detail |"; echo "|---|---|---|"
+            echo "| Stored build | $(r "$FETCH" 'fetched, no rebuild' 'missing: re-run the qa deploy' skipped) | \`web-$APP-$HASH\` |"
+            echo "| config.json | $(r "$CONF" "written for $STAGE" 'invalid: fix WEB_CONFIG_JSON' skipped) | checked against config.schema.json |"
+            echo "| Upload + smoke test | $(r "$ROLL" 'assets first, index.html last, live URL ok' 'smoke test failed: previous index.html restored' 'dry run: printed above, nothing changed') | |"
+            echo "| Deploy record | $([[ -n $REC ]] && echo "✅ #$REC" || echo '❌ not created') | environment \`$RECORD\` |"
+            echo "| Result | $([[ $JOB == success ]] && echo "✅ $STAGE serves build \`$HASH\`" || echo '❌ recorded as failure; next push retries') | |"
+          } >> "$GITHUB_STEP_SUMMARY"

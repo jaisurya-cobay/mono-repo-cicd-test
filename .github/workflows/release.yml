@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   release:
-    name: preflight + merge
+    name: "Release: preflight, then bot merges"
     if: vars.CICD_ENABLED != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -84,6 +84,7 @@ jobs:
           N: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
+          # --admin: the bot is master's only bypass actor, and a bypass must be asked for explicitly.
           # --match-head-commit: nothing pushed after preflight sneaks in.
-          gh pr merge "$N" --merge --match-head-commit "$HEAD_SHA"
+          gh pr merge "$N" --merge --admin --match-head-commit "$HEAD_SHA"
           echo "### ✅ Merged #$N. deploy.yml now ships it to production." >> "$GITHUB_STEP_SUMMARY"
