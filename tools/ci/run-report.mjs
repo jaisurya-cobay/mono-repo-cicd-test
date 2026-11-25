@@ -37,8 +37,21 @@ const fmt = (s) => (s === null ? "" : s < 90 ? `${Math.round(s)}s` : `${Math.rou
 const jobs = JSON.parse(gh(`repos/${repo}/actions/runs/${runId}/jobs?per_page=100`)).jobs.filter((j) => j.name !== self);
 const failed = jobs.filter((j) => ["failure", "timed_out", "cancelled"].includes(j.conclusion));
 
-// The real error: the job's own error annotations, else the last log lines of the failed step.
-function errorOf(job) {
+// Lines that carry the actual reason in common tool output (test runners, builds, npm, tsc, nx, shell).
+const SIGNAL = /✖|not ok|AssertionError|\bError\b|ERR!|ERR_|error TS\d+|FAIL\b|Failed tasks|^- @|failed$|expected|!==|not found|denied|timed out|ENOENT|EACCES|exit code [1-9]/i;
+const NOISE = /^\s*at |^\s*(shell|env):|^##\[|^\s*$|node_modules\/|^\s*(generatedMessage|code|operator|diff|actual|expected):/;
+
+// The job log, fetched directly: GitHub answers with a redirect to storage, which fetch follows.
+async function logOf(job) {
+  const res = await fetch(`https://api.github.com/repos/${repo}/actions/jobs/${job.id}/logs`, {
+    headers: { Authorization: `Bearer ${process.env.GH_TOKEN}`, Accept: "application/vnd.github+json" },
+  });
+  if (!res.ok) throw new Error(`log request answered ${res.status}`);
+  return (await res.text()).split("\n").map((l) => l.replace(/^\S+Z /, "").replace(/\x1b\[[0-9;]*m/g, "").trimEnd());
+}
+
+// The real error: the job's own error annotations, else the telling lines of the failed step's log.
+async function errorOf(job, step) {
   let notes = [];
   try {
     notes = JSON.parse(gh(`repos/${repo}/check-runs/${job.id}/annotations`))
@@ -46,14 +59,18 @@ function errorOf(job) {
       .map((a) => a.message.trim());
   } catch {}
   if (notes.length) return notes.slice(0, 3).join(" · ");
+  if (job.conclusion === "timed_out") return "the job ran past its time limit and was stopped";
   try {
-    const log = gh(`repos/${repo}/actions/jobs/${job.id}/logs`).split("\n").map((l) => l.replace(/^\S+Z /, "").replace(/\x1b\[[0-9;]*m/g, ""));
+    const log = await logOf(job);
+    // Only the failed step's part of the log: from its group header to the first ##[error].
+    let start = step ? log.findLastIndex((l, i) => l.startsWith("##[group]Run") && i < log.findIndex((x) => x.startsWith("##[error]"))) : 0;
     const end = log.findIndex((l) => l.startsWith("##[error]"));
-    const lines = log.slice(Math.max(0, (end < 0 ? log.length : end) - 12), end < 0 ? log.length : end)
-      .filter((l) => l.trim() && !l.startsWith("##[") && !/^\s*(shell|env):/.test(l));
-    return lines.slice(-6).join(" ⏎ ") || "no error text in the log";
-  } catch {
-    return job.conclusion === "timed_out" ? "the job ran past its time limit and was stopped" : "log not available";
+    const part = log.slice(Math.max(0, start), end < 0 ? log.length : end);
+    const telling = [...new Set(part.filter((l) => SIGNAL.test(l) && !NOISE.test(l)).map((l) => l.trim()))];
+    const lines = telling.length ? telling.slice(0, 8) : part.filter((l) => !NOISE.test(l)).slice(-6);
+    return lines.join(" ⏎ ") || "the step failed without printing an error";
+  } catch (e) {
+    return `could not read the log (${e.message}); open the job log below`;
   }
 }
 
@@ -68,9 +85,13 @@ for (const j of failed) {
   out.push("", `### ❌ ${j.name}`,
     "| | |", "|---|---|",
     `| Failed step | ${step ? step.name : j.conclusion === "timed_out" ? "time limit reached" : "before any step ran"} |`,
-    `| Error | ${errorOf(j).replace(/\|/g, "\\|").slice(0, 900)} |`,
     `| What to do | ${nextStep(j.name)} |`,
-    `| Log | ${j.html_url} |`);
+    `| Full log | ${j.html_url} |`);
+  // The required "ci" job only fails because another job did: name those instead of its own output.
+  const error = j.name === "ci"
+    ? `ci failed because: ${failed.filter((f) => f.name !== "ci").map((f) => f.name).join(", ") || "the route is not allowed (see Route PR)"}`
+    : await errorOf(j, step);
+  out.push("", "Error output:", "```text", ...error.split(" ⏎ ").map((l) => l.slice(0, 200)), "```");
 }
 if (failed.length) {
   out.push("", `Slack (lab: printed only): ❌ ${process.env.TITLE ?? "Run"} failed at ${failed.map((j) => j.name).join(", ")}. ${nextStep(failed[0].name)}`);
