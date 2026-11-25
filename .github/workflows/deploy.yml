@@ -254,7 +254,11 @@ jobs:
             n=$(gh pr list --head "$branch" --base "$target" --state open --json number --jq '.[0].number // empty')
             [[ -n $n ]] || n=$(gh pr create --base "$target" --head "$branch" --title "chore: back-merge master into $target" \
               --body "Automatic back-merge after the production release at ${GITHUB_SHA:0:7}. The bot merges it when ci is green." | grep -o '[0-9]*$')
-            if [[ $(gh pr view "$n" --json mergeable --jq .mergeable) == CONFLICTING ]]; then
+            # GitHub works out mergeability a few seconds after a PR opens: wait for a real answer.
+            for _ in $(seq 1 24); do
+              m=$(gh pr view "$n" --json mergeable --jq .mergeable); [[ $m != UNKNOWN ]] && break; sleep 5
+            done
+            if [[ $m == CONFLICTING ]]; then
               gh pr edit "$n" --add-label backmerge-conflict
               echo "::warning::Back-merge into $target conflicts (PR #$n). A person resolves it; the bot never does."
             else
