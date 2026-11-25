@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   release:
-    name: preflight + merge
+    name: "Release: preflight, then bot merges"
     if: vars.CICD_ENABLED != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -24,12 +24,14 @@ jobs:
       contents: read
       deployments: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           filter: tree:0
           persist-credentials: false
-      - id: pr
+      - name: "Preflight: find the one open PR into master"
+        id: pr
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -57,9 +59,11 @@ jobs:
           echo "### Release PR #$n ($head): approved, ci green" >> "$GITHUB_STEP_SUMMARY"
       # A normal release: staging must already run this exact code, and must hold every hotfix.
       # Hotfixes skip this (they never went through staging).
-      - if: steps.pr.outputs.head == 'staging'
+      - name: Install Node, pnpm and dependencies (cached)
+        if: steps.pr.outputs.head == 'staging'
         uses: ./.github/actions/setup
-      - if: steps.pr.outputs.head == 'staging'
+      - name: Check promoted apps already run this code one environment lower
+        if: steps.pr.outputs.head == 'staging'
         env:
           GH_TOKEN: ${{ github.token }}
           LOWER_ENV: staging
@@ -69,7 +73,8 @@ jobs:
         run: |
           git fetch --no-tags origin master
           node tools/ci/gate.mjs
-      - if: steps.pr.outputs.number != ''
+      - name: Get release bot token
+        if: steps.pr.outputs.number != ''
         id: bot
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
@@ -84,6 +89,31 @@ jobs:
           N: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
         run: |
+          # --admin: the bot is master's only bypass actor, and a bypass must be asked for explicitly.
           # --match-head-commit: nothing pushed after preflight sneaks in.
-          gh pr merge "$N" --merge --match-head-commit "$HEAD_SHA"
+          gh pr merge "$N" --merge --admin --match-head-commit "$HEAD_SHA"
           echo "### ✅ Merged #$N. deploy.yml now ships it to production." >> "$GITHUB_STEP_SUMMARY"
+
+  # Always last: one table of every job, and for each failure the failed step, the real error output
+  # and what to do next. Shown at the top of the run page.
+  report:
+    name: Run summary
+    needs: [release]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      actions: read
+      checks: read
+    steps:
+      - name: Check out CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: tools/ci
+          persist-credentials: false
+      - name: Write the run summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_JOB_NAME: Run summary
+          TITLE: "Release"
+        run: node tools/ci/run-report.mjs

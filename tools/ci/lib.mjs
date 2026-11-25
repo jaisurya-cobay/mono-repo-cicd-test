@@ -31,7 +31,9 @@ export function affected(base, head) {
 export function lastSuccess(environment, slug) {
   const list = JSON.parse(sh(`gh api "repos/${repo}/deployments?environment=${encodeURIComponent(environment)}&task=deploy:${slug}&per_page=30"`));
   for (const d of list) {
-    const state = sh(`gh api "repos/${repo}/deployments/${d.id}/statuses?per_page=1" --jq '.[0].state // ""'`);
+    // GitHub marks older deployments "inactive" when another app deploys to the same environment;
+    // skip that marker and read the real outcome underneath it.
+    const state = sh(`gh api "repos/${repo}/deployments/${d.id}/statuses?per_page=5" --jq '[.[] | select(.state != "inactive")][0].state // ""'`);
     if (state === "success") return { sha: d.sha, id: d.id, payload: d.payload };
   }
   return null;

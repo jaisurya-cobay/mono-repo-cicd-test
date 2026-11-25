@@ -18,7 +18,7 @@ permissions: {}
 
 jobs:
   build:
-    name: build ${{ inputs.app }}
+    name: Build, scan, push
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -30,14 +30,17 @@ jobs:
       IMAGE: ghcr.io/${{ github.repository }}/${{ inputs.app }}
       HASH: ${{ inputs.hash }}
     steps:
-      - id: ref
+      - name: Work out image name
+        id: ref
         run: echo "image=$IMAGE:$HASH" >> "$GITHUB_OUTPUT"
-      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+      - name: Log in to image registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - id: exists
+      - name: Check if this exact image already exists
+        id: exists
         env:
           REF: ${{ steps.ref.outputs.image }}
         run: |
@@ -45,16 +48,19 @@ jobs:
             echo "::notice::$REF already built, reusing it"
             echo "found=true" >> "$GITHUB_OUTPUT"
           fi
-      - if: steps.exists.outputs.found != 'true'
+      - name: Check out code
+        if: steps.exists.outputs.found != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ inputs.sha }}
           persist-credentials: false
-      - if: steps.exists.outputs.found != 'true'
+      - name: Set up Docker builder
+        if: steps.exists.outputs.found != 'true'
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       # Layer cache lives in the registry next to the image: unchanged apt/npm layers are pulled,
       # only the source layer is rebuilt. SBOM + provenance are attached to the image itself.
-      - if: steps.exists.outputs.found != 'true'
+      - name: Build and push image (layer cache, SBOM, provenance)
+        if: steps.exists.outputs.found != 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
@@ -68,10 +74,12 @@ jobs:
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
       # Vulnerability DB downloaded at most once a day.
-      - if: steps.exists.outputs.found != 'true'
+      - name: Today's date (cache key)
+        if: steps.exists.outputs.found != 'true'
         id: day
         run: echo "day=$(date -u +%F)" >> "$GITHUB_OUTPUT"
-      - if: steps.exists.outputs.found != 'true'
+      - name: Restore vulnerability database (cached daily)
+        if: steps.exists.outputs.found != 'true'
         # Holds only the public Trivy vulnerability DB, never build output.
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # zizmor: ignore[cache-poisoning] (v6)
         with:
@@ -80,6 +88,7 @@ jobs:
           restore-keys: trivy-db-
       - if: steps.exists.outputs.found != 'true'
         name: Scan (Trivy, report-only)
+        id: scan
         continue-on-error: true
         env:
           REF: ${{ steps.ref.outputs.image }}
@@ -89,3 +98,24 @@ jobs:
           docker run --rm -v ~/.cache/trivy:/root/.cache/trivy -e TRIVY_USERNAME -e TRIVY_PASSWORD aquasec/trivy:0.74.0 \
             image --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --format table "$REF" | tee trivy.txt
           { echo "### Trivy: \`${REF##*/}\`"; echo '```'; tail -n 40 trivy.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Write summary
+        if: always()
+        env:
+          REF: ${{ steps.ref.outputs.image }}
+          FOUND: ${{ steps.exists.outputs.found }}
+          SCAN: ${{ steps.scan.outcome }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          {
+            echo "### Image · ${REF##*/}"
+            echo "| | |"; echo "|---|---|"
+            if [[ $FOUND == true ]]; then
+              echo "| Result | ♻️ reused: this exact code was already built, nothing built or pushed |"
+            else
+              echo "| Result | 🔨 built once from commit \`${SHA:0:7}\` with the registry layer cache, pushed |"
+              echo "| SBOM + provenance | ✅ attached to the image |"
+              echo "| Vulnerability scan | $([[ $SCAN == success ]] && echo '✅ ran (table above)' || echo "⚠️ $SCAN (report only)") |"
+            fi
+            echo "| Image | \`$REF\` |"
+            echo "| Next | staging and production deploy this same image, never a rebuild |"
+          } >> "$GITHUB_STEP_SUMMARY"

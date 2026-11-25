@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   plan:
-    name: plan
+    name: "Plan: what changed"
     if: vars.CICD_ENABLED != 'false'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -35,19 +35,23 @@ jobs:
       projects: ${{ steps.plan.outputs.projects }}
       any: ${{ steps.plan.outputs.any }}
     steps:
-      - id: stage
+      - name: Map branch to environment
+        id: stage
         env:
           BRANCH: ${{ github.ref_name }}
         run: |
           case "$BRANCH" in qa) s=qa ;; staging) s=staging ;; master) s=production ;; esac
           echo "stage=$s" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           filter: tree:0
           persist-credentials: false
-      - uses: ./.github/actions/setup
-      - id: plan
+      - name: Install Node, pnpm and dependencies (cached)
+        uses: ./.github/actions/setup
+      - name: Compare each app with its last good deploy
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
           STAGE: ${{ steps.stage.outputs.stage }}
@@ -57,7 +61,7 @@ jobs:
 
   # QA only. staging and production promote code that already passed here (the gate proves it).
   test:
-    name: full tests
+    name: Full tests (qa only)
     needs: plan
     if: needs.plan.outputs.any == 'true' && needs.plan.outputs.stage == 'qa'
     runs-on: ubuntu-24.04
@@ -65,16 +69,26 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: ./.github/actions/setup
-      - env:
+      - name: Install Node, pnpm and dependencies (cached)
+        uses: ./.github/actions/setup
+      - name: Lint, types, unit and integration tests for the apps being deployed
+        env:
           PROJECTS: ${{ needs.plan.outputs.projects }}
-        run: pnpm exec nx run-many -t lint typecheck test integration -p "$PROJECTS" --outputStyle=static
+        run: |
+          pnpm exec nx run-many -t lint typecheck test integration -p "$PROJECTS" --outputStyle=static
+          {
+            echo "### Full tests (qa only)"
+            echo "Ran lint, types, unit and integration tests for: \`${PROJECTS//,/\`, \`}\`"
+            echo ""
+            echo "staging and production skip this: the promotion gate proves they get code that passed here."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   image:
-    name: image
+    name: Build image · ${{ matrix.app }}
     needs: [plan, test]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.server != '[]' && contains(fromJSON('["success","skipped"]'), needs.test.result)
     strategy:
@@ -92,7 +106,7 @@ jobs:
 
   # Web bundles: built ONCE per content hash, stored, reused by every environment.
   web-build:
-    name: web build (${{ matrix.app }})
+    name: Build web · ${{ matrix.app }}
     needs: [plan, test]
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.static != '[]' && contains(fromJSON('["success","skipped"]'), needs.test.result)
     runs-on: ubuntu-24.04
@@ -109,16 +123,20 @@ jobs:
       HASH: ${{ matrix.hash }}
       PROJECT: ${{ matrix.project }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - id: stored
+      - name: Check for a stored build of this exact code
+        id: stored
         env:
           GH_TOKEN: ${{ github.token }}
         run: echo "id=$(tools/ci/web-build.sh find "$APP" "$HASH")" >> "$GITHUB_OUTPUT"
-      - if: steps.stored.outputs.id == ''
+      - name: Install Node, pnpm and dependencies (cached)
+        if: steps.stored.outputs.id == ''
         uses: ./.github/actions/setup
-      - if: steps.stored.outputs.id == ''
+      - name: Build once
+        if: steps.stored.outputs.id == ''
         run: pnpm exec nx run "$PROJECT:build" --outputStyle=static
       - if: steps.stored.outputs.id == ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -126,11 +144,25 @@ jobs:
           name: web-${{ matrix.app }}-${{ matrix.hash }}
           path: ${{ matrix.root }}/dist
           retention-days: 90
-      - if: steps.stored.outputs.id != ''
-        run: echo "::notice::web-$APP-$HASH already built, reusing it"
+      - name: Write summary
+        if: always()
+        env:
+          STORED: ${{ steps.stored.outputs.id }}
+        run: |
+          {
+            echo "### Build web · $APP"
+            echo "| | |"; echo "|---|---|"
+            echo "| Content hash | \`$HASH\` |"
+            if [[ -n $STORED ]]; then
+              echo "| Result | ♻️ reused: already built for this exact code (artifact $STORED), nothing built |"
+            else
+              echo "| Result | 🔨 built once and stored as \`web-$APP-$HASH\` (kept 90 days) |"
+            fi
+            echo "| Next | every environment deploys these same files; only config.json differs |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   deploy-server:
-    name: server
+    name: Deploy · ${{ matrix.app }}
     needs: [plan, image]
     if: always() && needs.image.result == 'success'
     strategy:
@@ -153,7 +185,7 @@ jobs:
 
   # After the server, so a client never goes live against an API that isn't there yet.
   deploy-web:
-    name: web
+    name: Deploy · ${{ matrix.app }}
     needs: [plan, image, web-build, deploy-server]
     if: >-
       always() && needs.web-build.result == 'success' &&
@@ -181,7 +213,7 @@ jobs:
   # staging: rc tag + open/update the Release PR. master: release tag + GitHub Release + back-merge.
   # Runs only when nothing failed. Every step is safe to re-run.
   version:
-    name: version
+    name: Version & release
     needs: [plan, deploy-server, deploy-web]
     if: >-
       always() && needs.plan.result == 'success' && needs.plan.outputs.stage != 'qa' &&
@@ -192,7 +224,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - id: bot
+      - name: Get release bot token
+        id: bot
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
@@ -200,12 +233,14 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
       # Credentials kept on purpose: this job pushes tags and back-merge branches as the release bot.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # zizmor: ignore[artipacked] (v7)
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # zizmor: ignore[artipacked] (v7)
         with:
           fetch-depth: 0
           filter: tree:0
           token: ${{ steps.bot.outputs.token }}
-      - id: v
+      - name: Work out the version from PR titles
+        id: v
         env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           MODE: ${{ needs.plan.outputs.stage == 'staging' && 'rc' || 'final' }}
@@ -253,19 +288,23 @@ jobs:
             git push origin "$GITHUB_SHA:refs/heads/$branch" 2>/dev/null || true
             n=$(gh pr list --head "$branch" --base "$target" --state open --json number --jq '.[0].number // empty')
             [[ -n $n ]] || n=$(gh pr create --base "$target" --head "$branch" --title "chore: back-merge master into $target" \
-              --body "Automatic back-merge after the production release at ${GITHUB_SHA:0:7}. Auto-merges when ci is green." | grep -o '[0-9]*$')
-            if [[ $(gh pr view "$n" --json mergeable --jq .mergeable) == CONFLICTING ]]; then
+              --body "Automatic back-merge after the production release at ${GITHUB_SHA:0:7}. The bot merges it when ci is green." | grep -o '[0-9]*$')
+            # GitHub works out mergeability a few seconds after a PR opens: wait for a real answer.
+            for _ in $(seq 1 24); do
+              m=$(gh pr view "$n" --json mergeable --jq .mergeable); [[ $m != UNKNOWN ]] && break; sleep 5
+            done
+            if [[ $m == CONFLICTING ]]; then
               gh pr edit "$n" --add-label backmerge-conflict
               echo "::warning::Back-merge into $target conflicts (PR #$n). A person resolves it; the bot never does."
             else
-              gh pr merge "$n" --auto --merge
+              echo "$target: back-merge PR #$n opened; ci.yml merges it when ci is green"
             fi
           done
 
   # A promotion PR re-checks the moment its source branch moves, which is before that branch's deploy
   # finishes, so its gate can fail on the old deploy. Once the deploy is done, re-run that gate.
   refresh-gate:
-    name: refresh promotion gate
+    name: Re-check promotion PR
     needs: [plan, deploy-server, deploy-web]
     if: >-
       always() && needs.plan.result == 'success' && needs.plan.outputs.stage != 'production' &&
@@ -277,7 +316,8 @@ jobs:
       actions: write
       pull-requests: read
     steps:
-      - env:
+      - name: Re-run the open promotion PR's gate if it failed
+        env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SOURCE: ${{ github.ref_name }}
@@ -287,11 +327,17 @@ jobs:
           [[ -n $sha ]] || { echo "No open $SOURCE → $TARGET PR"; exit 0; }
           [[ $sha == "$GITHUB_SHA" ]] || { echo "PR head $sha is newer than this deploy; its own deploy will refresh it"; exit 0; }
           run=$(gh run list --workflow ci.yml --commit "$sha" --event pull_request --limit 1 --json databaseId,conclusion --jq '.[0] | select(.conclusion == "failure") | .databaseId')
-          if [[ -n $run ]]; then gh run rerun "$run" --failed && echo "Re-ran the gate on the $SOURCE → $TARGET PR"; else echo "Gate not failing; nothing to do"; fi
+          if [[ -n $run ]]; then
+            gh run rerun "$run" --failed
+            msg="🔁 the $SOURCE → $TARGET PR's gate had failed before this deploy finished; re-ran it"
+          else
+            msg="✅ the $SOURCE → $TARGET PR's gate is not failing; nothing to do"
+          fi
+          echo "$msg"; echo "### Re-check promotion PR"$'\n'"$msg" >> "$GITHUB_STEP_SUMMARY"
 
   # Jira + Slack never block a deploy. Lab: prints what the suite would send.
   notify:
-    name: notify
+    name: Notify Jira & Slack
     needs: [plan, deploy-server, deploy-web, version]
     if: always() && needs.plan.outputs.any == 'true'
     runs-on: ubuntu-24.04
@@ -300,14 +346,40 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           filter: tree:0
           persist-credentials: false
-      - env:
+      - name: "Send Jira and Slack updates (lab: dry run)"
+        env:
           GH_TOKEN: ${{ github.token }}
           STAGE: ${{ needs.plan.outputs.stage }}
           BEFORE: ${{ github.event.before }}
           RESULT: ${{ (needs.deploy-server.result == 'failure' || needs.deploy-web.result == 'failure') && 'failure' || 'success' }}
         run: node tools/ci/notify.mjs
+
+  # Always last: one table of every job, and for each failure the failed step, the real error output
+  # and what to do next. Shown at the top of the run page.
+  report:
+    name: Run summary
+    needs: [plan, test, image, web-build, deploy-server, deploy-web, version, refresh-gate, notify]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    permissions:
+      actions: read
+      checks: read
+    steps:
+      - name: Check out CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: tools/ci
+          persist-credentials: false
+      - name: Write the run summary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_JOB_NAME: Run summary
+          TITLE: "Deploy · ${{ github.ref_name }}"
+        run: node tools/ci/run-report.mjs

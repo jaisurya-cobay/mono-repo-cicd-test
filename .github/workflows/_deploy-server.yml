@@ -17,7 +17,7 @@ permissions: {}
 
 jobs:
   deploy:
-    name: ${{ inputs.app }} → ${{ inputs.stage }}
+    name: "→ ${{ inputs.stage }} (${{ inputs.live && 'live' || 'dry run' }})"
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: server-${{ inputs.stage }}
@@ -38,29 +38,33 @@ jobs:
       HASH: ${{ inputs.hash }}
       RECORD: ${{ inputs.record }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out CI scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           sparse-checkout: tools/ci
           persist-credentials: false
-      - id: start
+      - name: Open deploy record
+        id: start
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           id=$(tools/ci/record.sh start "$RECORD" "$APP" "$SHA" "{\"hash\":\"$HASH\"}")
           echo "id=$id" >> "$GITHUB_OUTPUT"
       # Deploys never build. The image must already exist (built on the qa merge or the hotfix PR).
-      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+      - name: Log in to image registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      - name: Image exists
+      - name: Verify image exists (deploys never build)
+        id: image
         run: |
           docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1 \
             || { echo "::error::$IMAGE not found. Deploys and rollbacks never build; re-run the qa deploy that built it."; exit 1; }
 
       # Not live for this app + environment: print exactly what would run, change nothing.
-      - name: Plan only (not live for this app + environment)
+      - name: "Dry run: print the plan (skipped when live)"
         if: env.LIVE != 'true'
         run: |
           {
@@ -72,7 +76,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Live path. Lab: stub. Suite: the commented block replaces the stub.
-      - name: Deploy (lab stub for OIDC + SSM rolling blue/green)
+      - name: "Roll out: SSM rolling blue/green (lab stub)"
+        id: rollout
         if: env.LIVE == 'true'
         env:
           TARGET: ${{ inputs.stage }}:${{ inputs.app }}
@@ -89,8 +94,26 @@ jobs:
           #          --timeout-seconds 1200 --cloud-watch-output-config CloudWatchOutputEnabled=true \
           #          --query Command.CommandId --output text)
           #   wait up to 25 min (longer than the 20-min SSM timeout); on give-up: aws ssm cancel-command
-      - if: always() && steps.start.outputs.id
+      - name: Close deploy record
+        if: always() && steps.start.outputs.id
         env:
           GH_TOKEN: ${{ github.token }}
           DEPLOYMENT_ID: ${{ steps.start.outputs.id }}
         run: tools/ci/record.sh ${{ job.status == 'success' && 'success' || 'failure' }} - - -
+      - name: Write summary
+        if: always()
+        env:
+          IMG: ${{ steps.image.outcome }}
+          ROLL: ${{ steps.rollout.outcome }}
+          REC: ${{ steps.start.outputs.id }}
+          JOB: ${{ job.status }}
+        run: |
+          r() { case $1 in success) echo "✅ $2" ;; failure) echo "❌ $3" ;; skipped|"") echo "⏭️ $4" ;; *) echo "⚠️ $1" ;; esac; }
+          {
+            echo "### Deploy · $APP → $STAGE ($([[ $LIVE == true ]] && echo live || echo 'dry run'))"
+            echo "| Step | Result | Detail |"; echo "|---|---|---|"
+            echo "| Image exists | $(r "$IMG" verified 'not found: deploys never build' skipped) | \`$IMAGE\` |"
+            echo "| Deploy record | $([[ -n $REC ]] && echo "✅ #$REC" || echo '❌ not created') | environment \`$RECORD\`, commit \`${SHA:0:7}\` |"
+            echo "| Rollout | $(r "$ROLL" 'healthy, traffic switched' 'unhealthy: old colour kept serving' 'dry run: printed above, nothing changed') | rolling 50%, health gate before swap |"
+            echo "| Result | $([[ $JOB == success ]] && echo "✅ $STAGE runs content \`$HASH\`" || echo '❌ recorded as failure; next push retries') | |"
+          } >> "$GITHUB_STEP_SUMMARY"
