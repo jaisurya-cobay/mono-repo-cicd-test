@@ -45,7 +45,11 @@ jobs:
           n=$(jq -r .number <<<"$pr"); head=$(jq -r .headRefName <<<"$pr")
           [[ $head == staging || $head == hotfix/* ]] || fail "PR #$n comes from $head. master takes only staging or hotfix/*."
           [[ $(jq -r .isDraft <<<"$pr") == false ]] || fail "PR #$n is a draft."
-          [[ $(jq -r .reviewDecision <<<"$pr") == APPROVED ]] || fail "PR #$n is not approved."
+          # The ruleset decides how many approvals are needed; block while GitHub says one is still required.
+          case $(jq -r '.reviewDecision // ""' <<<"$pr") in
+            REVIEW_REQUIRED) fail "PR #$n still needs its required approval." ;;
+            CHANGES_REQUESTED) fail "PR #$n has changes requested." ;;
+          esac
           [[ $(jq -r .mergeable <<<"$pr") == MERGEABLE ]] || fail "PR #$n has conflicts or can't be merged yet."
           ci=$(jq -r '[.statusCheckRollup[] | select(.name == "ci")][0].conclusion // "MISSING"' <<<"$pr")
           [[ $ci == SUCCESS ]] || fail "PR #$n: required check ci is $ci."
