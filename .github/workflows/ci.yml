@@ -91,10 +91,11 @@ jobs:
         run: pnpm exec nx affected -t integration --base="$BASE_SHA" --head=HEAD --outputStyle=static
 
   # Hotfix image is built on the PR, so the production deploy reuses it instead of building.
+  # Only after the title and tests pass, so a rejected hotfix never spends a build.
   hotfix-plan:
     name: hotfix plan
-    needs: lane
-    if: needs.lane.outputs.lane == 'hotfix'
+    needs: [lane, quick]
+    if: needs.lane.outputs.lane == 'hotfix' && needs.quick.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -207,6 +208,7 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           LOWER_ENV: ${{ github.base_ref == 'master' && 'staging' || 'qa' }}
+          LIVE_DEPLOYS: ${{ vars.LIVE_DEPLOYS }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
