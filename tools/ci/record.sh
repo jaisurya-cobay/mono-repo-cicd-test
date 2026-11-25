@@ -11,5 +11,6 @@ if [[ $action == start ]]; then
   gh api "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" --method POST -f state=in_progress >/dev/null
   echo "$id"
 else
-  gh api "repos/$GITHUB_REPOSITORY/deployments/$DEPLOYMENT_ID/statuses" --method POST -f state="$action" >/dev/null
+  # auto_inactive=false: one app's success must not mark other apps' deployments inactive.
+  gh api "repos/$GITHUB_REPOSITORY/deployments/$DEPLOYMENT_ID/statuses" --method POST -f state="$action" -F auto_inactive=false >/dev/null
 fi
